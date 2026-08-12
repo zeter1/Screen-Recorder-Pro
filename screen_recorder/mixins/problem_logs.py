@@ -628,9 +628,16 @@ class ProblemLogsMixin:
 - Для скриншотов сопоставляй hotkey_registration_*, hotkey_callback_received, screenshot_requested,
   native_screenshot_hotkey_ready, native_screenshot_hotkey_failed, native_screenshot_hotkey_stop_result,
   screenshot_snapshot_started, screenshot_snapshot_ready или screenshot_snapshot_failed,
-  capture_region_selector_opened, capture_region_selection_started, capture_region_selection_finished
+  capture_region_selector_opened, screenshot_annotation_tool_selected,
+  screenshot_annotation_color_selected, screenshot_annotation_size_selected,
+  screenshot_annotation_toolbar_moved, screenshot_annotation_added,
+  screenshot_annotation_undone, screenshot_annotations_cleared,
+  capture_region_selection_started, capture_region_selection_finished
   и screenshot_copied_to_clipboard. Исправный снимок временных меню имеет capture_stage=before_selector_focus,
   background_mode=frozen_snapshot_before_selector_focus и итоговый source=frozen_snapshot_before_selector_focus.
+  Для собственной панели пометок ожидается annotation_backend=screenshot_canvas_v3;
+  сравни annotation_count, annotation_colors и annotation_sizes при завершении выбора и после
+  копирования в буфер. toolbar_position_source=settings подтверждает восстановление позиции.
   Для Print Screen на Windows ожидаемый screenshot_backend=windows_register_hotkey, native_registered=true
   и native_thread_alive=true. keyboard_fallback означает неуспешный RegisterHotKey; читай windows_error.
   Если регистрация есть, но callback отсутствует после реального

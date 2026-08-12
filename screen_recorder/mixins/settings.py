@@ -97,6 +97,23 @@ class SettingsMixin:
             "problem_logs_cleanup_on_start": bool(self.problem_logs_cleanup_on_start_var.get()),
             "problem_logs_keep_successful": bool(self.problem_logs_keep_successful_var.get()),
         }
+        raw_settings = self.settings if isinstance(getattr(self, "settings", None), dict) else {}
+        data.update({
+            "screenshot_draw_color": normalize_screenshot_annotation_color(
+                raw_settings.get("screenshot_draw_color"),
+            ),
+            "screenshot_draw_size": normalize_screenshot_annotation_size(
+                raw_settings.get("screenshot_draw_size"),
+                "draw",
+            ),
+            "screenshot_arrow_color": normalize_screenshot_annotation_color(
+                raw_settings.get("screenshot_arrow_color"),
+            ),
+            "screenshot_arrow_size": normalize_screenshot_annotation_size(
+                raw_settings.get("screenshot_arrow_size"),
+                "arrow",
+            ),
+        })
         # Позиция плавающей панели сохраняется рядом с остальными настройками.
         try:
             if "floating_panel_x" in self.settings:
@@ -106,6 +123,9 @@ class SettingsMixin:
             for key in ("webcam_preview_x", "webcam_preview_y", "webcam_preview_width", "webcam_preview_height"):
                 if key in self.settings:
                     data[key] = int(self.settings.get(key))
+            for key in ("screenshot_toolbar_x", "screenshot_toolbar_y"):
+                if key in raw_settings:
+                    data[key] = int(raw_settings.get(key))
         except Exception:
             pass
         try:

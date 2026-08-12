@@ -228,11 +228,12 @@ class ScreenshotsHotkeysMixin:
             return
         self.select_capture_region(
             allow_while_recording=True,
-            hint_text="Выдели область для скриншота мышью.  Esc — отмена.",
+            hint_text="Выдели область или сначала добавь пометки.  Esc — отмена.",
             on_result=self._after_screenshot_region_selected,
             purpose="screenshot",
             background_image=frozen_image,
             screen_rect=frozen_screen_rect,
+            enable_annotations=True,
         )
 
     def _after_screenshot_region_selected(self, region, selection_info=None):
@@ -279,12 +280,13 @@ class ScreenshotsHotkeysMixin:
             self._finish_screenshot_capture(False, None, str(exc))
             return
 
+        annotations = list(selection_info.get("annotations") or [])
         self.screenshot_status_var.set("Копирую выбранную область в буфер обмена...")
         # Повторно экран не читаем: копируем область из кадра, сохранённого до
         # того, как окно выбора забрало фокус у браузера или панели стикеров.
-        self._start_screenshot_worker(region)
+        self._start_screenshot_worker(region, annotations=annotations)
 
-    def _start_screenshot_worker(self, region):
+    def _start_screenshot_worker(self, region, annotations=None):
         if getattr(self, "_exiting", False):
             self._screenshot_in_progress = False
             self._clear_screenshot_frozen_image()
@@ -302,7 +304,7 @@ class ScreenshotsHotkeysMixin:
         try:
             self.screenshot_thread = threading.Thread(
                 target=self._take_screenshot_worker,
-                args=(region, snapshot, list(screen_rect), captured_perf),
+                args=(region, snapshot, list(screen_rect), captured_perf, list(annotations or [])),
                 daemon=True,
                 name="ScreenshotWorker",
             )
@@ -335,10 +337,93 @@ class ScreenshotsHotkeysMixin:
             raise ValueError("Выбранная область находится вне сохранённого экрана.")
         return left, top, right, bottom
 
-    def _take_screenshot_worker(self, region, snapshot, screen_rect, captured_perf=None):
+    @staticmethod
+    def apply_screenshot_annotations(image, annotations, screen_rect):
+        """Наносит карандаш и стрелки на сохранённый кадр до обрезки области."""
+        if image is None or ImageDraw is None or not annotations:
+            return 0
+        vx, vy, virtual_width, virtual_height = [int(value) for value in screen_rect]
+        image_width, image_height = [int(value) for value in image.size]
+        if virtual_width < 1 or virtual_height < 1 or image_width < 1 or image_height < 1:
+            raise ValueError("Некорректная геометрия кадра для аннотаций.")
+        scale_x = image_width / float(virtual_width)
+        scale_y = image_height / float(virtual_height)
+        width_scale = max(0.25, (scale_x + scale_y) / 2.0)
+        painter = ImageDraw.Draw(image)
+
+        def map_point(point):
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                return None
+            try:
+                x, y = point[:2]
+                return (
+                    int(round((float(x) - vx) * scale_x)),
+                    int(round((float(y) - vy) * scale_y)),
+                )
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        applied = 0
+        for command in list(annotations)[:1000]:
+            if not isinstance(command, dict):
+                continue
+            tool = str(command.get("tool") or "")
+            color = str(command.get("color") or "#ff3b30")
+            try:
+                width = max(1, min(96, int(round(float(command.get("width", 5)) * width_scale))))
+            except (TypeError, ValueError, OverflowError):
+                width = max(1, int(round(5 * width_scale)))
+            if tool == "draw":
+                raw_points = command.get("points") or []
+                if not isinstance(raw_points, (list, tuple)):
+                    continue
+                points = []
+                for raw_point in raw_points[:20000]:
+                    point = map_point(raw_point)
+                    if point is not None:
+                        points.append(point)
+                if not points:
+                    continue
+                if len(points) == 1:
+                    x, y = points[0]
+                    radius = max(1, width // 2)
+                    painter.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+                else:
+                    painter.line(points, fill=color, width=width, joint="curve")
+                applied += 1
+            elif tool == "arrow":
+                start = map_point(command.get("start"))
+                end = map_point(command.get("end"))
+                if start is None or end is None:
+                    continue
+                dx = float(end[0] - start[0])
+                dy = float(end[1] - start[1])
+                length = (dx * dx + dy * dy) ** 0.5
+                if length < 2.0:
+                    continue
+                painter.line((start, end), fill=color, width=width)
+                ux, uy = dx / length, dy / length
+                head_length = min(length * 0.45, max(12.0 * width_scale, width * 3.5))
+                wing = head_length * 0.48
+                base_x = end[0] - ux * head_length
+                base_y = end[1] - uy * head_length
+                perp_x, perp_y = -uy, ux
+                painter.polygon(
+                    (
+                        end,
+                        (int(round(base_x + perp_x * wing)), int(round(base_y + perp_y * wing))),
+                        (int(round(base_x - perp_x * wing)), int(round(base_y - perp_y * wing))),
+                    ),
+                    fill=color,
+                )
+                applied += 1
+        return applied
+
+    def _take_screenshot_worker(self, region, snapshot, screen_rect, captured_perf=None, annotations=None):
         started = time.perf_counter()
         image = None
         try:
+            annotation_count = self.apply_screenshot_annotations(snapshot, annotations or [], screen_rect)
             crop_box = self.get_screenshot_snapshot_crop_box(region, screen_rect, snapshot.size)
             image = snapshot.crop(crop_box)
             if image.size[0] < 1 or image.size[1] < 1:
@@ -352,6 +437,21 @@ class ScreenshotsHotkeysMixin:
                 "captured_height": image.size[1],
                 "elapsed_sec": round(time.perf_counter() - started, 3),
                 "source": "frozen_snapshot_before_selector_focus",
+                "annotation_backend": "screenshot_canvas_v3",
+                "annotation_count": annotation_count,
+                "annotation_tools": sorted({
+                    str(item.get("tool")) for item in (annotations or []) if isinstance(item, dict)
+                }),
+                "annotation_colors": sorted({
+                    str(item.get("color"))
+                    for item in (annotations or [])
+                    if isinstance(item, dict) and item.get("color")
+                }),
+                "annotation_sizes": sorted({
+                    int(item.get("width"))
+                    for item in (annotations or [])
+                    if isinstance(item, dict) and item.get("width")
+                }),
                 "snapshot_size": [int(snapshot.size[0]), int(snapshot.size[1])],
                 "snapshot_age_sec": (
                     round(max(0.0, time.perf_counter() - float(captured_perf)), 3)

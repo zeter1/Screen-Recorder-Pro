@@ -748,6 +748,7 @@ class InstantBufferMixin:
         purpose="recording",
         background_image=None,
         screen_rect=None,
+        enable_annotations=False,
     ):
         """Полноэкранный выбор прямоугольной области мышью.
 
@@ -760,6 +761,7 @@ class InstantBufferMixin:
         во время записи через allow_while_recording=True.
         """
         purpose = str(purpose or "recording")
+        annotation_enabled = bool(enable_annotations and background_image is not None and purpose == "screenshot")
         selector_started = time.perf_counter()
         done_called = {"v": False}
 
@@ -779,7 +781,16 @@ class InstantBufferMixin:
                 result["status"] = str(status or details.get("status") or "cancelled")
                 result["region"] = list(region) if region else None
             level = "WARN" if result["status"] in {"selector_error", "release_without_press"} else "INFO"
-            self.diagnostic_log("capture_region_selection_finished", result, level=level)
+            log_result = dict(result)
+            annotation_commands = log_result.pop("annotations", None)
+            if annotation_commands is not None:
+                log_result["annotation_count"] = len(annotation_commands)
+                log_result["annotation_tools"] = sorted({
+                    str(item.get("tool"))
+                    for item in annotation_commands
+                    if isinstance(item, dict) and item.get("tool")
+                })
+            self.diagnostic_log("capture_region_selection_finished", log_result, level=level)
             try:
                 if on_result:
                     on_result(region, result)
@@ -837,8 +848,9 @@ class InstantBufferMixin:
                     stipple="gray50",
                 )
                 background_mode = "frozen_snapshot_before_selector_focus"
-            # Подсказка является элементом Canvas, а не отдельным Label. Поэтому
-            # она больше не перехватывает ButtonPress и не создаёт мёртвую зону.
+            # Подсказка и панель инструментов являются элементами Canvas, а не
+            # отдельными окнами. Служебный интерфейс не попадает в итоговый кадр:
+            # скриншот строится из background_image и списка аннотаций.
             hint_item = canvas.create_text(
                 int(vw / 2),
                 24,
@@ -847,7 +859,9 @@ class InstantBufferMixin:
                 font=("Segoe UI", 13, "bold"),
                 anchor="n",
                 justify="center",
+                tags=("capture_hint",),
             )
+            hint_background = None
             hint_bounds = canvas.bbox(hint_item)
             if hint_bounds:
                 left, top, right, bottom = hint_bounds
@@ -858,39 +872,721 @@ class InstantBufferMixin:
                     bottom + 6,
                     fill="black",
                     outline="",
+                    tags=("capture_hint",),
                 )
                 canvas.tag_lower(hint_background, hint_item)
-            state = {"sx": 0, "sy": 0, "cx": 0, "cy": 0, "rect": None, "pressed": False}
+            saved_settings = (
+                self.settings
+                if isinstance(getattr(self, "settings", None), dict)
+                else {}
+            )
+            initial_draw_color = normalize_screenshot_annotation_color(
+                saved_settings.get("screenshot_draw_color"),
+            )
+            initial_arrow_color = normalize_screenshot_annotation_color(
+                saved_settings.get("screenshot_arrow_color"),
+            )
+            initial_draw_size = normalize_screenshot_annotation_size(
+                saved_settings.get("screenshot_draw_size"),
+                "draw",
+            )
+            initial_arrow_size = normalize_screenshot_annotation_size(
+                saved_settings.get("screenshot_arrow_size"),
+                "arrow",
+            )
+            state = {
+                "sx": 0,
+                "sy": 0,
+                "cx": 0,
+                "cy": 0,
+                "rect": None,
+                "pressed": False,
+                "interaction": None,
+                "mode": "select",
+                "toolbar_press": False,
+                "active_item": None,
+                "active_global_points": [],
+                "active_local_points": [],
+                "active_color": initial_draw_color,
+                "active_size": initial_draw_size,
+                "annotation_records": [],
+                "hover_action": None,
+                "hover_color_id": None,
+                "hover_size": None,
+                "panel_dragging": False,
+                "panel_drag_start": None,
+                "panel_drag_origin": None,
+                "panel_drag_moved": False,
+                "tool_colors": {
+                    "draw": initial_draw_color,
+                    "arrow": initial_arrow_color,
+                },
+                "tool_sizes": {
+                    "draw": initial_draw_size,
+                    "arrow": initial_arrow_size,
+                },
+            }
+            toolbar_buttons = []
+            color_buttons = []
+            size_buttons = []
+            color_specs = SCREENSHOT_ANNOTATION_COLORS
+            panel_x = 8
+            panel_y = 64
+            panel_width = 0
+            panel_height = 42
+            color_panel_height = 40
+            size_panel_height = 40
+            option_panel_gap = 4
+            panel_position_source = "near_cursor"
+            panel_position_clamped = False
+
+            def annotation_details():
+                commands = [dict(record["command"]) for record in state["annotation_records"]]
+                return {
+                    "annotations": commands,
+                    "annotation_count": len(commands),
+                    "annotation_tools": sorted({
+                        str(command.get("tool")) for command in commands if command.get("tool")
+                    }),
+                    "annotation_colors": sorted({
+                        str(command.get("color")) for command in commands if command.get("color")
+                    }),
+                    "annotation_sizes": sorted({
+                        int(command.get("width")) for command in commands if command.get("width")
+                    }),
+                }
+
+            def update_hint(text):
+                canvas.itemconfigure(hint_item, text=text)
+                bounds = canvas.bbox(hint_item)
+                if hint_background is not None and bounds:
+                    left, top, right, bottom = bounds
+                    canvas.coords(
+                        hint_background,
+                        left - 12,
+                        top - 6,
+                        right + 12,
+                        bottom + 6,
+                    )
+
+            if annotation_enabled:
+                try:
+                    pointer_root_x, pointer_root_y = sel.winfo_pointerxy()
+                except Exception:
+                    pointer_root_x, pointer_root_y = vx + int(vw / 2), vy + int(vh / 2)
+                button_specs = (
+                    ("move", "✥", 36),
+                    ("select", "▣ Область", 82),
+                    ("draw", "✎ Рисовать", 92),
+                    ("arrow", "➜ Стрелка", 82),
+                    ("undo", "↶ Назад", 72),
+                    ("clear", "× Очистить", 84),
+                )
+                panel_width = sum(spec[2] for spec in button_specs) + (len(button_specs) - 1) * 4 + 12
+                try:
+                    if "screenshot_toolbar_x" not in saved_settings or "screenshot_toolbar_y" not in saved_settings:
+                        raise KeyError("saved screenshot toolbar position is incomplete")
+                    panel_x = int(saved_settings.get("screenshot_toolbar_x")) - int(vx)
+                    panel_y = int(saved_settings.get("screenshot_toolbar_y")) - int(vy)
+                    panel_position_source = "settings"
+                except (TypeError, ValueError, OverflowError, KeyError):
+                    panel_x = int(pointer_root_x - vx + 22)
+                    panel_y = int(pointer_root_y - vy + 22)
+                    panel_position_source = "near_cursor"
+                requested_panel_position = [int(panel_x), int(panel_y)]
+                panel_x = max(8, min(max(8, int(vw) - panel_width - 8), panel_x))
+                options_height = color_panel_height + option_panel_gap + size_panel_height
+                if panel_y + panel_height + options_height + 14 > int(vh):
+                    panel_y = int(pointer_root_y - vy - panel_height - options_height - 22)
+                panel_y = max(
+                    8,
+                    min(
+                        max(8, int(vh) - panel_height - options_height - 14),
+                        panel_y,
+                    ),
+                )
+                panel_position_clamped = requested_panel_position != [int(panel_x), int(panel_y)]
+                canvas.create_rectangle(
+                    panel_x,
+                    panel_y,
+                    panel_x + panel_width,
+                    panel_y + panel_height,
+                    fill="#171717",
+                    outline="#555555",
+                    width=1,
+                    tags=("capture_toolbar",),
+                )
+                button_x = panel_x + 6
+                for action, label, button_width in button_specs:
+                    bounds = (
+                        button_x,
+                        panel_y + 6,
+                        button_x + button_width,
+                        panel_y + panel_height - 6,
+                    )
+                    rect_item = canvas.create_rectangle(
+                        *bounds,
+                        fill="#303030",
+                        outline="#555555",
+                        width=1,
+                        tags=("capture_toolbar", f"capture_tool_{action}"),
+                    )
+                    text_item = canvas.create_text(
+                        int((bounds[0] + bounds[2]) / 2),
+                        int((bounds[1] + bounds[3]) / 2),
+                        text=label,
+                        fill="white",
+                        font=("Segoe UI", 9, "bold"),
+                        tags=("capture_toolbar", f"capture_tool_{action}"),
+                    )
+                    toolbar_buttons.append({
+                        "action": action,
+                        "bounds": bounds,
+                        "rect": rect_item,
+                        "text": text_item,
+                    })
+                    button_x += button_width + 4
+
+            def raise_selector_controls():
+                if annotation_enabled:
+                    canvas.tag_raise("capture_color_palette")
+                    canvas.tag_raise("capture_size_palette")
+                    canvas.tag_raise("capture_toolbar")
+                canvas.tag_raise("capture_hint")
+
+            def refresh_color_palette(hover_color_id=None):
+                selected_color = state["tool_colors"].get(state["mode"])
+                for color_button in color_buttons:
+                    active = color_button["color"] == selected_color
+                    hovered = color_button["id"] == hover_color_id
+                    outline = "#ffffff" if active else ("#9ec5ff" if hovered else "#6b7280")
+                    width = 3 if active else (2 if hovered else 1)
+                    canvas.itemconfigure(color_button["swatch"], outline=outline, width=width)
+                raise_selector_controls()
+
+            def refresh_size_palette(hover_size=None):
+                selected_size = state["tool_sizes"].get(state["mode"])
+                for size_button in size_buttons:
+                    active = size_button["size"] == selected_size
+                    hovered = size_button["size"] == hover_size
+                    fill = "#2563eb" if active else ("#454545" if hovered else "#303030")
+                    outline = "#9ec5ff" if active else "#666666"
+                    canvas.itemconfigure(
+                        size_button["button"],
+                        fill=fill,
+                        outline=outline,
+                        width=2 if active else 1,
+                    )
+                raise_selector_controls()
+
+            def render_tool_option_palettes():
+                canvas.delete("capture_color_palette")
+                canvas.delete("capture_size_palette")
+                color_buttons.clear()
+                size_buttons.clear()
+                if state["mode"] not in {"draw", "arrow"}:
+                    state["hover_color_id"] = None
+                    state["hover_size"] = None
+                    raise_selector_controls()
+                    return
+                active_button = next(
+                    (button for button in toolbar_buttons if button["action"] == state["mode"]),
+                    None,
+                )
+                if active_button is None:
+                    return
+                swatch_size = 22
+                swatch_gap = 4
+                palette_width = 12 + len(color_specs) * swatch_size + (len(color_specs) - 1) * swatch_gap
+                button_left, _button_top, button_right, button_bottom = active_button["bounds"]
+                palette_x = int((button_left + button_right - palette_width) / 2)
+                palette_x = max(8, min(max(8, int(vw) - palette_width - 8), palette_x))
+                palette_y = int(button_bottom + 12)
+                canvas.create_rectangle(
+                    palette_x,
+                    palette_y,
+                    palette_x + palette_width,
+                    palette_y + color_panel_height,
+                    fill="#171717",
+                    outline="#555555",
+                    width=1,
+                    tags=("capture_color_palette",),
+                )
+                swatch_x = palette_x + 6
+                swatch_y = palette_y + int((color_panel_height - swatch_size) / 2)
+                for color_id, color_value in color_specs:
+                    bounds = (
+                        swatch_x,
+                        swatch_y,
+                        swatch_x + swatch_size,
+                        swatch_y + swatch_size,
+                    )
+                    swatch = canvas.create_oval(
+                        *bounds,
+                        fill=color_value,
+                        outline="#6b7280",
+                        width=1,
+                        tags=("capture_color_palette", f"capture_color_{color_id}"),
+                    )
+                    color_buttons.append({
+                        "id": color_id,
+                        "color": color_value,
+                        "bounds": bounds,
+                        "swatch": swatch,
+                    })
+                    swatch_x += swatch_size + swatch_gap
+                size_choices = (
+                    SCREENSHOT_ARROW_SIZES
+                    if state["mode"] == "arrow"
+                    else SCREENSHOT_DRAW_SIZES
+                )
+                size_panel_y = palette_y + color_panel_height + option_panel_gap
+                canvas.create_rectangle(
+                    palette_x,
+                    size_panel_y,
+                    palette_x + palette_width,
+                    size_panel_y + size_panel_height,
+                    fill="#171717",
+                    outline="#555555",
+                    width=1,
+                    tags=("capture_size_palette",),
+                )
+                canvas.create_text(
+                    palette_x + 8,
+                    size_panel_y + int(size_panel_height / 2),
+                    text="Размер:",
+                    fill="white",
+                    font=("Segoe UI", 9, "bold"),
+                    anchor="w",
+                    tags=("capture_size_palette",),
+                )
+                size_button_width = 30
+                size_button_gap = 4
+                size_button_x = palette_x + 64
+                size_button_y = size_panel_y + 6
+                for size_value in size_choices:
+                    bounds = (
+                        size_button_x,
+                        size_button_y,
+                        size_button_x + size_button_width,
+                        size_button_y + size_panel_height - 12,
+                    )
+                    size_button = canvas.create_rectangle(
+                        *bounds,
+                        fill="#303030",
+                        outline="#666666",
+                        width=1,
+                        tags=("capture_size_palette", f"capture_size_{size_value}"),
+                    )
+                    canvas.create_text(
+                        int((bounds[0] + bounds[2]) / 2),
+                        int((bounds[1] + bounds[3]) / 2),
+                        text=str(size_value),
+                        fill="white",
+                        font=("Segoe UI", 9, "bold"),
+                        tags=("capture_size_palette", f"capture_size_{size_value}"),
+                    )
+                    size_buttons.append({
+                        "size": int(size_value),
+                        "bounds": bounds,
+                        "button": size_button,
+                    })
+                    size_button_x += size_button_width + size_button_gap
+                refresh_color_palette(state.get("hover_color_id"))
+                refresh_size_palette(state.get("hover_size"))
+
+            def refresh_toolbar(hover_action=None):
+                for button in toolbar_buttons:
+                    action = button["action"]
+                    active = action == state["mode"]
+                    hovered = action == hover_action
+                    fill = "#2563eb" if active else ("#454545" if hovered else "#303030")
+                    outline = "#78a9ff" if active else "#555555"
+                    canvas.itemconfigure(button["rect"], fill=fill, outline=outline)
+                raise_selector_controls()
+
+            def set_mode(mode, log_event=True):
+                state["mode"] = mode
+                state["pressed"] = False
+                state["interaction"] = None
+                state["active_item"] = None
+                state["active_global_points"] = []
+                state["active_local_points"] = []
+                if mode == "draw":
+                    # `cross` штатно поддерживается Tk на Windows. Имена вроде
+                    # `pencil` зависят от платформы и могли дать TclError уже
+                    # после нажатия кнопки рисования.
+                    canvas.configure(cursor="cross")
+                    update_hint("Рисуй мышью. Затем нажми «Область» и выдели итоговый снимок.")
+                elif mode == "arrow":
+                    canvas.configure(cursor="cross")
+                    update_hint("Протяни мышью к острию стрелки. Затем нажми «Область».")
+                else:
+                    canvas.configure(cursor="cross")
+                    update_hint("Выдели область или сначала добавь пометки.  Esc — отмена.")
+                render_tool_option_palettes()
+                refresh_toolbar(state.get("hover_action"))
+                if log_event:
+                    self.diagnostic_log("screenshot_annotation_tool_selected", {
+                        "purpose": purpose,
+                        "tool": mode,
+                        "selected_color": state["tool_colors"].get(mode),
+                        "selected_size": state["tool_sizes"].get(mode),
+                        "color_palette_visible": mode in {"draw", "arrow"},
+                        "size_palette_visible": mode in {"draw", "arrow"},
+                        "annotation_count": len(state["annotation_records"]),
+                    })
+
+            def hit_toolbar(x, y):
+                if not annotation_enabled:
+                    return None
+                for button in toolbar_buttons:
+                    left, top, right, bottom = button["bounds"]
+                    if left <= x <= right and top <= y <= bottom:
+                        return button["action"]
+                # Свободные промежутки и фон основной панели тоже служат зоной
+                # перетаскивания, а кнопка с символом ✥ делает это заметным.
+                if panel_x <= x <= panel_x + panel_width and panel_y <= y <= panel_y + panel_height:
+                    return "move"
+                return None
+
+            def hit_color_palette(x, y):
+                if state["mode"] not in {"draw", "arrow"}:
+                    return None
+                for color_button in color_buttons:
+                    left, top, right, bottom = color_button["bounds"]
+                    if left <= x <= right and top <= y <= bottom:
+                        return color_button
+                return None
+
+            def hit_size_palette(x, y):
+                if state["mode"] not in {"draw", "arrow"}:
+                    return None
+                for size_button in size_buttons:
+                    left, top, right, bottom = size_button["bounds"]
+                    if left <= x <= right and top <= y <= bottom:
+                        return size_button
+                return None
+
+            def persist_screenshot_tool_setting(key, value):
+                if not isinstance(getattr(self, "settings", None), dict):
+                    self.settings = {}
+                self.settings[str(key)] = value
+                schedule_save = getattr(self, "schedule_save_settings", None)
+                if callable(schedule_save):
+                    try:
+                        schedule_save()
+                    except Exception as exc:
+                        self.diagnostic_log(
+                            "screenshot_tool_setting_save_schedule_failed",
+                            {"key": str(key), "error": repr(exc)},
+                            level="WARN",
+                        )
+
+            def select_annotation_color(color_button):
+                tool = state["mode"]
+                if tool not in {"draw", "arrow"}:
+                    return
+                color_value = color_button["color"]
+                state["tool_colors"][tool] = color_value
+                persist_screenshot_tool_setting(f"screenshot_{tool}_color", color_value)
+                refresh_color_palette(state.get("hover_color_id"))
+                self.diagnostic_log("screenshot_annotation_color_selected", {
+                    "purpose": purpose,
+                    "tool": tool,
+                    "color_id": color_button["id"],
+                    "color": color_value,
+                    "annotation_count": len(state["annotation_records"]),
+                })
+
+            def select_annotation_size(size_button):
+                tool = state["mode"]
+                if tool not in {"draw", "arrow"}:
+                    return
+                size_value = normalize_screenshot_annotation_size(size_button["size"], tool)
+                state["tool_sizes"][tool] = size_value
+                persist_screenshot_tool_setting(f"screenshot_{tool}_size", size_value)
+                refresh_size_palette(state.get("hover_size"))
+                self.diagnostic_log("screenshot_annotation_size_selected", {
+                    "purpose": purpose,
+                    "tool": tool,
+                    "size": size_value,
+                    "annotation_count": len(state["annotation_records"]),
+                })
+
+            def remove_annotation_record(record):
+                for item in record.get("items", []):
+                    try:
+                        canvas.delete(item)
+                    except Exception:
+                        pass
+
+            def clamp_toolbar_position(x, y):
+                options_height = color_panel_height + option_panel_gap + size_panel_height
+                max_x = max(8, int(vw) - panel_width - 8)
+                max_y = max(8, int(vh) - panel_height - options_height - 14)
+                return (
+                    max(8, min(max_x, int(round(x)))),
+                    max(8, min(max_y, int(round(y)))),
+                )
+
+            def move_toolbar_to(x, y):
+                nonlocal panel_x, panel_y
+                new_x, new_y = clamp_toolbar_position(x, y)
+                dx = new_x - panel_x
+                dy = new_y - panel_y
+                if not dx and not dy:
+                    return False
+                canvas.move("capture_toolbar", dx, dy)
+                for button in toolbar_buttons:
+                    left, top, right, bottom = button["bounds"]
+                    button["bounds"] = (
+                        left + dx,
+                        top + dy,
+                        right + dx,
+                        bottom + dy,
+                    )
+                panel_x = new_x
+                panel_y = new_y
+                render_tool_option_palettes()
+                refresh_toolbar(state.get("hover_action"))
+                return True
+
+            def persist_toolbar_position():
+                global_x = int(vx) + int(panel_x)
+                global_y = int(vy) + int(panel_y)
+                persist_screenshot_tool_setting("screenshot_toolbar_x", global_x)
+                persist_screenshot_tool_setting("screenshot_toolbar_y", global_y)
+                self.diagnostic_log("screenshot_annotation_toolbar_moved", {
+                    "purpose": purpose,
+                    "global_position": [global_x, global_y],
+                    "local_position": [int(panel_x), int(panel_y)],
+                    "virtual_screen": [int(vx), int(vy), int(vw), int(vh)],
+                    "visible_screen_clamp_enforced": True,
+                })
+
+            def handle_toolbar_action(action):
+                if action in {"select", "draw", "arrow"}:
+                    set_mode(action)
+                    return
+                if action == "undo":
+                    if state["annotation_records"]:
+                        record = state["annotation_records"].pop()
+                        remove_annotation_record(record)
+                        self.diagnostic_log("screenshot_annotation_undone", {
+                            "purpose": purpose,
+                            "tool": record["command"].get("tool"),
+                            "annotation_count": len(state["annotation_records"]),
+                        })
+                    refresh_toolbar(state.get("hover_action"))
+                    return
+                if action == "clear":
+                    removed = len(state["annotation_records"])
+                    for record in state["annotation_records"]:
+                        remove_annotation_record(record)
+                    state["annotation_records"].clear()
+                    self.diagnostic_log("screenshot_annotations_cleared", {
+                        "purpose": purpose,
+                        "removed": removed,
+                    })
+                    refresh_toolbar(state.get("hover_action"))
 
             def close(status="escape"):
                 try:
                     sel.destroy()
                 except Exception:
                     pass
-                finish(status=status)
+                finish(status=status, details=annotation_details())
 
             def on_press(event):
+                color_button = hit_color_palette(event.x, event.y)
+                if color_button:
+                    state["toolbar_press"] = True
+                    state["pressed"] = False
+                    select_annotation_color(color_button)
+                    return "break"
+                size_button = hit_size_palette(event.x, event.y)
+                if size_button:
+                    state["toolbar_press"] = True
+                    state["pressed"] = False
+                    select_annotation_size(size_button)
+                    return "break"
+                toolbar_action = hit_toolbar(event.x, event.y)
+                if toolbar_action:
+                    if toolbar_action == "move":
+                        state["toolbar_press"] = False
+                        state["pressed"] = False
+                        state["panel_dragging"] = True
+                        state["panel_drag_start"] = [int(event.x), int(event.y)]
+                        state["panel_drag_origin"] = [int(panel_x), int(panel_y)]
+                        state["panel_drag_moved"] = False
+                        update_hint("Перемести панель и отпусти мышь — позиция сохранится.")
+                        return "break"
+                    state["toolbar_press"] = True
+                    state["pressed"] = False
+                    handle_toolbar_action(toolbar_action)
+                    return "break"
+                state["toolbar_press"] = False
                 state["sx"], state["sy"] = event.x_root, event.y_root
                 state["cx"], state["cy"] = event.x, event.y
                 state["pressed"] = True
-                if state["rect"]:
-                    canvas.delete(state["rect"])
-                state["rect"] = canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="#ff3b3b", width=2)
-                self.diagnostic_log("capture_region_selection_started", {
-                    "purpose": purpose,
-                    "start": [int(event.x_root), int(event.y_root)],
-                    "minimum_size": 16,
-                })
+                state["interaction"] = state["mode"]
+                if state["mode"] == "select":
+                    if state["rect"]:
+                        canvas.delete(state["rect"])
+                    state["rect"] = canvas.create_rectangle(
+                        event.x,
+                        event.y,
+                        event.x,
+                        event.y,
+                        outline="#ff3b3b",
+                        width=2,
+                        tags=("capture_selection_rect",),
+                    )
+                    self.diagnostic_log("capture_region_selection_started", {
+                        "purpose": purpose,
+                        "start": [int(event.x_root), int(event.y_root)],
+                        "minimum_size": 16,
+                        "annotation_count": len(state["annotation_records"]),
+                    })
+                elif state["mode"] == "draw":
+                    state["active_color"] = state["tool_colors"]["draw"]
+                    state["active_size"] = state["tool_sizes"]["draw"]
+                    state["active_global_points"] = [[int(event.x_root), int(event.y_root)]]
+                    state["active_local_points"] = [[int(event.x), int(event.y)]]
+                    state["active_item"] = canvas.create_line(
+                        event.x,
+                        event.y,
+                        event.x + 1,
+                        event.y + 1,
+                        fill=state["active_color"],
+                        width=state["active_size"],
+                        capstyle=tk.ROUND,
+                        joinstyle=tk.ROUND,
+                        tags=("capture_annotation",),
+                    )
+                elif state["mode"] == "arrow":
+                    state["active_color"] = state["tool_colors"]["arrow"]
+                    state["active_size"] = state["tool_sizes"]["arrow"]
+                    arrow_size = int(state["active_size"])
+                    state["active_item"] = canvas.create_line(
+                        event.x,
+                        event.y,
+                        event.x,
+                        event.y,
+                        fill=state["active_color"],
+                        width=arrow_size,
+                        arrow=tk.LAST,
+                        arrowshape=(
+                            max(12, arrow_size * 4),
+                            max(16, arrow_size * 5),
+                            max(6, arrow_size * 2),
+                        ),
+                        tags=("capture_annotation",),
+                    )
+                raise_selector_controls()
+                return "break"
 
             def on_drag(event):
-                if state["pressed"] and state["rect"]:
+                if state["panel_dragging"]:
+                    drag_start = state["panel_drag_start"] or [int(event.x), int(event.y)]
+                    drag_origin = state["panel_drag_origin"] or [int(panel_x), int(panel_y)]
+                    moved = move_toolbar_to(
+                        drag_origin[0] + int(event.x) - drag_start[0],
+                        drag_origin[1] + int(event.y) - drag_start[1],
+                    )
+                    state["panel_drag_moved"] = bool(state["panel_drag_moved"] or moved)
+                    return "break"
+                if not state["pressed"]:
+                    return "break"
+                if state["interaction"] == "select" and state["rect"]:
                     canvas.coords(state["rect"], state["cx"], state["cy"], event.x, event.y)
+                elif state["interaction"] == "draw" and state["active_item"]:
+                    points = state["active_local_points"]
+                    if points and abs(event.x - points[-1][0]) + abs(event.y - points[-1][1]) < 2:
+                        return "break"
+                    points.append([int(event.x), int(event.y)])
+                    state["active_global_points"].append([int(event.x_root), int(event.y_root)])
+                    canvas.coords(state["active_item"], *[value for point in points for value in point])
+                elif state["interaction"] == "arrow" and state["active_item"]:
+                    canvas.coords(state["active_item"], state["cx"], state["cy"], event.x, event.y)
+                raise_selector_controls()
+                return "break"
 
             def on_release(event):
+                if state["panel_dragging"]:
+                    state["panel_dragging"] = False
+                    state["panel_drag_start"] = None
+                    state["panel_drag_origin"] = None
+                    persist_toolbar_position()
+                    set_mode(state["mode"], log_event=False)
+                    return "break"
+                if state["toolbar_press"]:
+                    state["toolbar_press"] = False
+                    return "break"
                 if not state["pressed"]:
+                    if annotation_enabled:
+                        self.diagnostic_log("capture_region_release_ignored", {
+                            "purpose": purpose,
+                            "reason": "release_without_canvas_press",
+                        })
+                        return "break"
                     close(status="release_without_press")
-                    return
+                    return "break"
                 state["pressed"] = False
+                interaction = state["interaction"]
+                state["interaction"] = None
+                if interaction == "draw":
+                    points = state["active_global_points"]
+                    item = state["active_item"]
+                    if points:
+                        command = {
+                            "tool": "draw",
+                            "points": [list(point) for point in points],
+                            "color": state["active_color"],
+                            "width": state["active_size"],
+                        }
+                        state["annotation_records"].append({"command": command, "items": [item]})
+                        self.diagnostic_log("screenshot_annotation_added", {
+                            "purpose": purpose,
+                            "tool": "draw",
+                            "color": state["active_color"],
+                            "size": state["active_size"],
+                            "point_count": len(points),
+                            "annotation_count": len(state["annotation_records"]),
+                        })
+                    state["active_item"] = None
+                    state["active_global_points"] = []
+                    state["active_local_points"] = []
+                    refresh_toolbar(state.get("hover_action"))
+                    return "break"
+                if interaction == "arrow":
+                    start = [int(state["sx"]), int(state["sy"])]
+                    end = [int(event.x_root), int(event.y_root)]
+                    item = state["active_item"]
+                    if abs(end[0] - start[0]) + abs(end[1] - start[1]) >= 8:
+                        command = {
+                            "tool": "arrow",
+                            "start": start,
+                            "end": end,
+                            "color": state["active_color"],
+                            "width": state["active_size"],
+                        }
+                        state["annotation_records"].append({"command": command, "items": [item]})
+                        self.diagnostic_log("screenshot_annotation_added", {
+                            "purpose": purpose,
+                            "tool": "arrow",
+                            "color": state["active_color"],
+                            "size": state["active_size"],
+                            "start": start,
+                            "end": end,
+                            "annotation_count": len(state["annotation_records"]),
+                        })
+                    elif item:
+                        canvas.delete(item)
+                    state["active_item"] = None
+                    refresh_toolbar(state.get("hover_action"))
+                    return "break"
                 region, details = self.normalize_capture_region_drag(
                     state["sx"],
                     state["sy"],
@@ -898,15 +1594,40 @@ class InstantBufferMixin:
                     event.y_root,
                     minimum_size=16,
                 )
+                details.update(annotation_details())
                 try:
                     sel.destroy()
                 except Exception:
                     pass
                 finish(region, status=details["status"], details=details)
+                return "break"
+
+            def on_motion(event):
+                if not annotation_enabled or state["pressed"] or state["panel_dragging"]:
+                    return
+                hover_action = hit_toolbar(event.x, event.y)
+                if hover_action != state["hover_action"]:
+                    state["hover_action"] = hover_action
+                    refresh_toolbar(hover_action)
+                color_button = hit_color_palette(event.x, event.y)
+                hover_color_id = color_button["id"] if color_button else None
+                if hover_color_id != state["hover_color_id"]:
+                    state["hover_color_id"] = hover_color_id
+                    refresh_color_palette(hover_color_id)
+                size_button = hit_size_palette(event.x, event.y)
+                hover_size = size_button["size"] if size_button else None
+                if hover_size != state["hover_size"]:
+                    state["hover_size"] = hover_size
+                    refresh_size_palette(hover_size)
 
             canvas.bind("<ButtonPress-1>", on_press)
             canvas.bind("<B1-Motion>", on_drag)
             canvas.bind("<ButtonRelease-1>", on_release)
+            canvas.bind("<Motion>", on_motion)
+            if annotation_enabled:
+                set_mode("select", log_event=False)
+            else:
+                raise_selector_controls()
             sel.bind("<Escape>", lambda _event: close(status="escape"))
             sel.update_idletasks()
             self.diagnostic_log("capture_region_selector_opened", {
@@ -915,6 +1636,46 @@ class InstantBufferMixin:
                 "minimum_size": 16,
                 "hint_widget": "canvas_item",
                 "mouse_event_surface": "fullscreen_canvas",
+                "annotation_tools_enabled": annotation_enabled,
+                "annotation_backend": "screenshot_canvas_v3" if annotation_enabled else None,
+                "initial_tool": "select" if annotation_enabled else None,
+                "available_annotation_tools": (
+                    ["select", "draw", "arrow", "undo", "clear"]
+                    if annotation_enabled else []
+                ),
+                "available_annotation_colors": (
+                    [color_value for _color_id, color_value in color_specs]
+                    if annotation_enabled else []
+                ),
+                "available_annotation_sizes": {
+                    "draw": list(SCREENSHOT_DRAW_SIZES),
+                    "arrow": list(SCREENSHOT_ARROW_SIZES),
+                } if annotation_enabled else {},
+                "initial_annotation_settings": {
+                    "draw": {
+                        "color": initial_draw_color,
+                        "size": initial_draw_size,
+                    },
+                    "arrow": {
+                        "color": initial_arrow_color,
+                        "size": initial_arrow_size,
+                    },
+                } if annotation_enabled else {},
+                "color_palette_behavior": (
+                    "persistent_below_active_draw_or_arrow_tool"
+                    if annotation_enabled else None
+                ),
+                "size_palette_behavior": (
+                    "persistent_below_color_palette"
+                    if annotation_enabled else None
+                ),
+                "toolbar_position": (
+                    [int(vx) + int(panel_x), int(vy) + int(panel_y)]
+                    if annotation_enabled else None
+                ),
+                "toolbar_position_source": panel_position_source if annotation_enabled else None,
+                "toolbar_position_clamped": panel_position_clamped if annotation_enabled else False,
+                "toolbar_drag_surface": "handle_and_panel_background" if annotation_enabled else None,
                 "background_mode": background_mode,
                 "background_image_size": (
                     [int(background_image.size[0]), int(background_image.size[1])]

@@ -84,8 +84,8 @@ except Exception:
 DXCAM_CAPTURE_ENABLED = False
 
 APP_NAME = "ScreenRecorderProWin11"
-APP_BUILD = "2026-08-12-native-printscreen-hotkey-v13"
-DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v13"
+APP_BUILD = "2026-08-12-screenshot-toolbar-persistence-v16"
+DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v16"
 PROBLEM_LOGS_FOLDER_NAME = "Логи проблем"
 NO_AUDIO = "Не записывать"
 MIC_AUDIO_DEFAULT = "Микрофон (по умолчанию Windows)"
@@ -96,6 +96,41 @@ SYSTEM_AUDIO_WASAPI = "Звук компьютера (WASAPI loopback — авт
 WASAPI_RENDER_PREFIX = "WASAPI loopback: "
 WEBCAM_AUTO = "Авто (первая найденная)"
 VIDEO_FORMATS = ["mp4", "mkv", "avi", "mov"]
+
+# Собственные инструменты скриншота. Значения хранятся в settings.json, поэтому
+# список и нормализаторы находятся в shared.py и одинаково используются UI,
+# сохранением настроек и регрессионными тестами.
+SCREENSHOT_ANNOTATION_COLORS = (
+    ("red", "#ff3b30"),
+    ("orange", "#ff9500"),
+    ("yellow", "#ffd60a"),
+    ("green", "#34c759"),
+    ("cyan", "#00c7be"),
+    ("blue", "#0a84ff"),
+    ("purple", "#bf5af2"),
+    ("white", "#ffffff"),
+    ("black", "#111111"),
+)
+SCREENSHOT_DRAW_SIZES = (2, 5, 8, 12, 18)
+SCREENSHOT_ARROW_SIZES = (2, 4, 6, 8, 12)
+
+
+def normalize_screenshot_annotation_color(value, default="#ff3b30"):
+    allowed = {color.lower(): color for _color_id, color in SCREENSHOT_ANNOTATION_COLORS}
+    normalized_default = str(default or "#ff3b30").strip().lower()
+    fallback = allowed.get(normalized_default, SCREENSHOT_ANNOTATION_COLORS[0][1])
+    return allowed.get(str(value or "").strip().lower(), fallback)
+
+
+def normalize_screenshot_annotation_size(value, tool="draw"):
+    tool = str(tool or "draw").strip().lower()
+    choices = SCREENSHOT_ARROW_SIZES if tool == "arrow" else SCREENSHOT_DRAW_SIZES
+    default = 4 if tool == "arrow" else 5
+    try:
+        size = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return size if size in choices else default
 
 CAPTURE_METHODS = [
     "Desktop Duplication / ddagrab",
