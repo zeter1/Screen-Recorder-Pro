@@ -62,7 +62,14 @@ def main() -> int:
 
     print("3. Импорт главного класса...")
     from screen_recorder.app import ScreenRecorderProWin11
-    from screen_recorder.shared import APP_BUILD, APP_DIR, NO_AUDIO
+    from screen_recorder.shared import (
+        APP_BUILD,
+        APP_DIR,
+        NO_AUDIO,
+        Image,
+        normalize_screenshot_annotation_color,
+        normalize_screenshot_annotation_size,
+    )
 
     methods = {
         name for name, value in inspect.getmembers(ScreenRecorderProWin11)
@@ -73,7 +80,7 @@ def main() -> int:
         "build_smooth_video_filter", "write_ai_smoothness_report",
         "open_settings_window", "ensure_tray_icon", "exit_app",
         "normalize_capture_region_drag", "select_capture_region",
-        "get_screenshot_snapshot_crop_box",
+        "get_screenshot_snapshot_crop_box", "apply_screenshot_annotations",
         "parse_native_print_screen_hotkey", "_start_native_screenshot_hotkey",
         "_stop_native_screenshot_hotkey", "_is_native_screenshot_hotkey_healthy",
         "_is_owned_problem_log_item",
@@ -135,6 +142,65 @@ def main() -> int:
         print("ОШИБКА: DPI-масштаб снимка обработан неверно:", scaled_box)
         return 1
 
+    if normalize_screenshot_annotation_color("#34C759") != "#34c759":
+        print("ОШИБКА: сохранённый цвет скриншота не нормализуется.")
+        return 1
+    if normalize_screenshot_annotation_color("not-a-color") != "#ff3b30":
+        print("ОШИБКА: повреждённый цвет скриншота не заменён безопасным значением.")
+        return 1
+    if normalize_screenshot_annotation_size("12", "draw") != 12:
+        print("ОШИБКА: размер кисти не восстанавливается из settings.json.")
+        return 1
+    if normalize_screenshot_annotation_size(8, "arrow") != 8:
+        print("ОШИБКА: размер стрелки не восстанавливается из settings.json.")
+        return 1
+    if normalize_screenshot_annotation_size(999, "arrow") != 4:
+        print("ОШИБКА: повреждённый размер стрелки не заменён безопасным значением.")
+        return 1
+
+    if Image is None:
+        print("ОШИБКА: Pillow недоступен, инструменты скриншота не смогут собрать изображение.")
+        return 1
+    annotation_image = Image.new("RGB", (120, 100), "white")
+    try:
+        applied_annotations = ScreenRecorderProWin11.apply_screenshot_annotations(
+            annotation_image,
+            [
+                {
+                    "tool": "draw",
+                    "points": [[10, 10], [25, 25], [40, 40]],
+                    "color": "#34c759",
+                    "width": 12,
+                },
+                {
+                    "tool": "arrow",
+                    "start": [60, 70],
+                    "end": [105, 70],
+                    "color": "#0a84ff",
+                    "width": 8,
+                },
+                {"tool": "draw", "points": [None, ["bad", 2]]},
+            ],
+            [0, 0, 120, 100],
+        )
+        if applied_annotations != 2:
+            print("ОШИБКА: нанесено неверное число аннотаций:", applied_annotations)
+            return 1
+        if annotation_image.getpixel((25, 25)) != (52, 199, 89):
+            print("ОШИБКА: выбранный зелёный цвет карандаша не попал в изображение.")
+            return 1
+        if annotation_image.getpixel((25, 29)) != (52, 199, 89):
+            print("ОШИБКА: выбранная толщина кисти не применена к изображению.")
+            return 1
+        if annotation_image.getpixel((80, 70)) != (10, 132, 255):
+            print("ОШИБКА: выбранный синий цвет стрелки не попал в изображение.")
+            return 1
+        if annotation_image.getpixel((80, 73)) != (10, 132, 255):
+            print("ОШИБКА: выбранный размер стрелки не применён к изображению.")
+            return 1
+    finally:
+        annotation_image.close()
+
     native_print_screen = ScreenRecorderProWin11.parse_native_print_screen_hotkey("print screen")
     if native_print_screen != {
         "modifiers": 0,
@@ -171,13 +237,53 @@ def main() -> int:
     if "background_image" not in selector_source or "frozen_snapshot_before_selector_focus" not in selector_source:
         print("ОШИБКА: окно выделения не показывает кадр, сохранённый до потери фокуса.")
         return 1
+    for required_tool_marker in (
+        '("select", "▣ Область"',
+        '("draw", "✎ Рисовать"',
+        '("arrow", "➜ Стрелка"',
+        'f"capture_tool_{action}"',
+        "capture_color_palette",
+        "capture_size_palette",
+        "SCREENSHOT_ANNOTATION_COLORS",
+        'f"capture_color_{color_id}"',
+        'f"capture_size_{size_value}"',
+        "screenshot_toolbar_x",
+        "screenshot_toolbar_y",
+        "screenshot_canvas_v3",
+    ):
+        if required_tool_marker not in selector_source:
+            print("ОШИБКА: отсутствует собственный инструмент скриншота:", required_tool_marker)
+            return 1
+    if "AnnotationOverlay(" in selector_source:
+        print("ОШИБКА: скриншот снова создаёт рисовалку видеозаписи вместо собственной панели.")
+        return 1
     for required_event in (
         "capture_region_selector_opened",
         "capture_region_selection_started",
         "capture_region_selection_finished",
+        "screenshot_annotation_tool_selected",
+        "screenshot_annotation_color_selected",
+        "screenshot_annotation_size_selected",
+        "screenshot_annotation_toolbar_moved",
+        "screenshot_annotation_added",
+        "screenshot_annotation_undone",
+        "screenshot_annotations_cleared",
     ):
         if required_event not in selector_source:
             print("ОШИБКА: отсутствует диагностическое событие:", required_event)
+            return 1
+
+    settings_source = inspect.getsource(ScreenRecorderProWin11.save_settings)
+    for persisted_key in (
+        "screenshot_draw_color",
+        "screenshot_draw_size",
+        "screenshot_arrow_color",
+        "screenshot_arrow_size",
+        "screenshot_toolbar_x",
+        "screenshot_toolbar_y",
+    ):
+        if persisted_key not in settings_source:
+            print("ОШИБКА: параметр скриншота не сохраняется в settings.json:", persisted_key)
             return 1
 
     snapshot_worker_source = inspect.getsource(ScreenRecorderProWin11._capture_screenshot_snapshot_worker)
@@ -187,6 +293,11 @@ def main() -> int:
         return 1
     if "ImageGrab.grab" in clipboard_worker_source or "snapshot.crop" not in clipboard_worker_source:
         print("ОШИБКА: после выбора область снова читается с изменившегося рабочего стола.")
+        return 1
+    annotation_position = clipboard_worker_source.find("apply_screenshot_annotations")
+    crop_position = clipboard_worker_source.find("snapshot.crop")
+    if annotation_position < 0 or crop_position < 0 or annotation_position > crop_position:
+        print("ОШИБКА: пометки скриншота наносятся не на замороженный кадр до обрезки.")
         return 1
     screenshot_source = "\n".join((
         inspect.getsource(ScreenRecorderProWin11._start_screenshot_snapshot_worker),

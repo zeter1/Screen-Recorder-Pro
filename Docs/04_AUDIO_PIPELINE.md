@@ -1,0 +1,162 @@
+# 04. Конвейер звука
+
+## Поддерживаемые источники
+
+### Микрофон
+
+- Windows default;
+- конкретное DShow-устройство;
+- конкретное WASAPI input, если FFmpeg поддерживает WASAPI.
+
+### Системный звук
+
+- Windows default render endpoint;
+- Windows communications endpoint;
+- конкретный `WASAPI loopback: <устройство>`;
+- DShow loopback вроде `Stereo Mix` или virtual-audio-capturer;
+- Python CoreAudio loopback fallback.
+
+## Важное различие
+
+Следующие устройства обычно являются входами, а не системным звуком:
+
+```text
+Microphone
+Line In
+Focusrite Analogue 1+2
+обычный analog input
+```
+
+Они не должны автоматически выбираться как источник звука Telegram, YouTube или игры.
+
+Допустимые DShow loopback-признаки определяются в `is_valid_dshow_system_audio_source()`:
+
+```text
+Stereo Mix
+Стерео микшер
+What U Hear
+Wave Out
+Loopback
+virtual-audio-capturer
+Cable Output
+```
+
+## Выбор пути
+
+### FFmpeg поддерживает WASAPI
+
+Системный звук добавляется как вход FFmpeg:
+
+```text
+-f wasapi -loopback 1 -i <endpoint>
+```
+
+Микрофон и системный звук обрабатываются через filter graph и смешиваются внутри записи сегмента.
+
+### FFmpeg не поддерживает WASAPI
+
+Для системного звука используется:
+
+```text
+WasapiLoopbackWaveRecorder
+```
+
+Поток Windows CoreAudio параллельно пишет WAV. После остановки сегмента WAV подмешивается к видео.
+
+## CoreAudio loopback
+
+Класс находится в `screen_recorder/components/audio_loopback.py`.
+
+Критические свойства:
+
+- запускается от фактического старта сегмента, а не от клика до countdown;
+- выход — stereo PCM16;
+- поддерживает float/PCM 16/24/32-bit вход;
+- тишина дополняется по `perf_counter`, потому что WASAPI loopback может не выдавать пакеты, когда ничего не играет;
+- COM-объекты и WAV должны закрываться в `finally`;
+- незавершённый или пустой WAV считается ошибкой, а не успешной записью без звука.
+
+## Обработка микрофона
+
+Микрофон сначала приводится к mono, затем явно дублируется в stereo:
+
+```text
+aresample=48000:async=1:first_pts=0
+aformat=...:channel_layouts=mono
+pan=stereo|c0=c0|c1=c0
+volume=...
+alimiter=limit=0.95
+```
+
+Это предотвращает голос только в левом или правом наушнике.
+
+## Обработка системного звука
+
+Системный звук сохраняется в stereo:
+
+```text
+aresample=48000:async=1:first_pts=0
+aformat=...:channel_layouts=stereo
+volume=...
+alimiter=limit=0.95
+```
+
+При нескольких источниках используется `amix` с `duration=longest` и без автоматической нормализации.
+
+## Подмешивание Python loopback
+
+`mix_python_loopback_audio_into_segment()`:
+
+1. проверяет, есть ли в исходном сегменте микрофон;
+2. измеряет тайминги до смешивания;
+3. добавляет WAV системного звука;
+4. сохраняет видео без перекодирования, аудио кодирует;
+5. проверяет результат через ffprobe;
+6. пишет события timing before/after.
+
+Нельзя молча продолжать финальную сборку, если обязательный WAV не подмешался.
+
+## Выравнивание A/V
+
+`prepare_segments_with_aligned_audio()` сравнивает:
+
+```text
+video_start
+video_end
+audio_start
+audio_end
+```
+
+Если начало или конец отличаются больше допустимого порога, создаётся выровненная копия:
+
+```text
+aresample=48000:async=1:first_pts=0,apad
+-shortest
+-avoid_negative_ts make_zero
+```
+
+После этого результат снова проверяется. Допустимая остаточная разница обычно до 0.12 секунды.
+
+## Регрессионные проверки
+
+В `verify_project.py` уже проверяется:
+
+- микрофон и Focusrite Analogue не считаются системным звуком;
+- `Stereo Mix` распознаётся;
+- некорректный `@staticmethod`, использующий `self`/`cls`, обнаруживается.
+
+При исправлении аудио добавляй минимальный тест, который воспроизводит найденную ошибку без оборудования, если это возможно.
+
+## Ручная проверка
+
+Проверить отдельно:
+
+1. только микрофон;
+2. только системный звук;
+3. микрофон + системный звук;
+4. участок с тишиной, затем воспроизведение звука;
+5. пауза/resume;
+6. смену default output до запуска следующей записи;
+7. начало и конец дорожек через логи/ffprobe;
+8. голос в обоих каналах;
+9. отсутствие обрезанного последнего слова или звука.

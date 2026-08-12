@@ -1,10 +1,10 @@
 # Screen Recorder Pro
 
-**Windows screen recorder built with Python, Tkinter and FFmpeg.**
+**Windows screen recorder and screenshot tool built with Python, Tkinter and FFmpeg.**
 
-Screen Recorder Pro is a modular Windows desktop application for screen recording, screenshots, microphone/system-audio capture, webcam preview and detailed recording diagnostics. The current source build is `2026-08-12-native-printscreen-hotkey-v13`.
+Screen Recorder Pro is a modular Windows desktop application for screen recording, screenshots, microphone/system-audio capture, webcam preview and detailed recording diagnostics. The current source build is `2026-08-12-screenshot-toolbar-persistence-v16`.
 
-The project intentionally prioritizes recording stability, useful diagnostics and safe cleanup of background processes over aggressive refactoring.
+The project prioritizes recording stability, useful diagnostics and safe cleanup of background processes. Recent work extends the screenshot workflow without rewriting the validated ddagrab/NVENC/CFR recording pipeline.
 
 ## Highlights
 
@@ -13,7 +13,10 @@ The project intentionally prioritizes recording stability, useful diagnostics an
 - microphone and Windows system-audio capture;
 - CoreAudio loopback fallback when FFmpeg WASAPI is unavailable;
 - global hotkeys, including native Windows `RegisterHotKey` handling for Print Screen;
-- region screenshots based on a frozen desktop snapshot;
+- frozen-desktop region screenshots so menus and transient UI remain visible while selecting an area;
+- screenshot toolbar with **Region**, **Draw**, **Arrow**, **Undo** and **Clear** tools;
+- separate persistent colors and sizes for drawing and arrow tools;
+- persistent screenshot-toolbar position with automatic clamping when monitor geometry changes;
 - pause/resume and multi-segment finalization;
 - webcam preview and annotation overlay;
 - tray operation and Windows autostart support;
@@ -42,6 +45,7 @@ For the project's validated 144 Hz → 72 FPS scenario, the application polls `d
 main.py
 Screen Recorder Pro.py
 verify_project.py
+Docs/
 screen_recorder/
 ├── app.py
 ├── shared.py
@@ -68,6 +72,8 @@ screen_recorder/
 ```
 
 `ScreenRecorderProWin11` is assembled from mixins. The modules separate recording, audio, FFmpeg commands, lifecycle, UI, diagnostics, screenshots and finalization without changing the public launcher.
+
+Detailed architecture and troubleshooting notes are available in [`Docs/README.md`](Docs/README.md).
 
 ## Requirements
 
@@ -104,24 +110,15 @@ python verify_project.py
 python -m compileall .
 ```
 
-`verify_project.py` checks, among other things:
+`verify_project.py` checks project structure, required methods, system-audio selection regressions, screenshot-region behavior and safe log-cleanup ownership rules.
 
-- that all Python files compile;
-- mixin structure and required methods;
-- system-audio device selection regressions;
-- screenshot-region normalization;
-- native Print Screen hotkey implementation;
-- safe ownership checks for automatic log cleanup.
+The v16 source package was checked before publication in a non-Windows environment: `verify_project.py` completed successfully and `compileall` found no Python syntax errors.
 
-The supplied source archive was checked before publication: `verify_project.py` completed successfully and `compileall` found no Python syntax errors.
-
-> Hardware-dependent recording behavior — real `ddagrab`, NVENC, Windows clipboard, low-level hotkeys and physical audio devices — must still be verified on Windows hardware.
-
-See `VALIDATION.txt` for the latest project-specific validation notes.
+> Hardware-dependent behavior — real `ddagrab`, NVENC, Windows clipboard, native hotkeys and physical audio devices — still requires verification on Windows hardware.
 
 ## Diagnostics and reliability
 
-The application contains dedicated diagnostics for FFmpeg commands, recording events, timing, smoothness, errors and source-version fingerprints. Runtime logs, settings, temporary recordings and generated media are excluded from Git.
+The application contains dedicated diagnostics for FFmpeg commands, recording events, timing, smoothness, screenshot selection, hotkeys, errors and source-version fingerprints. Runtime logs, settings, temporary recordings and generated media are excluded from Git.
 
 Long-running and external-process code is designed around:
 
@@ -134,11 +131,7 @@ Long-running and external-process code is designed around:
 
 ## AI-assisted development
 
-`AGENTS.md` documents project invariants and validation rules used during AI-assisted development with Codex/ChatGPT. AI-generated changes are treated as proposals and are validated with repository checks and manual Windows testing where hardware behavior is involved.
-
-## Current validation snapshot
-
-`VALIDATION.txt` documents the v13/v12/v11 regression work around native Print Screen registration, screenshot selection, bounded diagnostics and preservation of the stable recording pipeline.
+`AGENTS.md` and the `Docs/` folder document project invariants, architecture and validation rules used during AI-assisted development with Codex/ChatGPT. AI-generated changes are treated as proposals and are validated with repository checks and manual Windows testing where hardware behavior is involved.
 
 ## License
 
