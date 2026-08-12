@@ -1,0 +1,7 @@
+psutil
+numpy
+Pillow
+keyboard
+pystray
+dxcam
+opencv-python

@@ -1,0 +1,1121 @@
+from ..shared import *
+
+
+class InstantBufferMixin:
+    def cleanup_dxcam_references(self):
+        """Даёт Python шанс удалить старые DXcam-объекты перед новым стартом.
+
+        В dxcam есть внутренний singleton на device/output. Если старый объект ещё
+        жив хотя бы по одной ссылке, новый dxcam.create() возвращает тот же
+        instance. Само по себе это не ошибка, но после stop/release старый объект
+        иногда остаётся в промежуточном состоянии и может подвесить grab/start.
+        """
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+    def release_dxcam_camera_safely(self, camera, label="dxcam_camera"):
+        """Останавливает и освобождает DXcam-камеру без зависания GUI.
+
+        DXcam иногда зависает внутри camera.stop()/release() на старом
+        singleton-объекте. Если вызвать это из Tkinter-потока, всё окно Windows
+        помечает как «Не отвечает». Поэтому GUI-поток только отдаёт освобождение
+        отдельному daemon-потоку; реальные DXcam-вызовы выполняются не в UI.
+        """
+        if camera is None:
+            return
+        try:
+            gui_ident = getattr(self, "gui_thread_ident", None)
+            if gui_ident is not None and threading.get_ident() == gui_ident:
+                threading.Thread(
+                    target=self._release_dxcam_camera_worker,
+                    args=(camera, label),
+                    name=f"release_{label}",
+                    daemon=True,
+                ).start()
+                return
+        except Exception:
+            pass
+        self._release_dxcam_camera_worker(camera, label)
+
+    def _release_dxcam_camera_worker(self, camera, label="dxcam_camera"):
+        if camera is None:
+            return
+        try:
+            with self.dxcam_camera_io_lock:
+                try:
+                    camera.stop()
+                except Exception as exc:
+                    self.log_message(f"{label}.stop ignored: {exc}")
+                try:
+                    camera.release()
+                except Exception as exc:
+                    self.log_message(f"{label}.release ignored: {exc}")
+        except Exception as exc:
+            self.log_exception(f"{label}.release_dxcam_camera_safely", exc)
+        finally:
+            try:
+                del camera
+            except Exception:
+                pass
+            self.cleanup_dxcam_references()
+
+    def create_dxcam_camera_safely(self):
+        self.cleanup_dxcam_references()
+        with self.dxcam_camera_io_lock:
+            return dxcam.create(output_color="BGR")
+
+    def safe_start_dxcam_camera(self, camera_obj, fps_int):
+        """Старт DXcam без падения, если singleton уже запущен буфером."""
+        with self.dxcam_camera_io_lock:
+            try:
+                camera_obj.start(target_fps=fps_int, video_mode=True)
+                return True
+            except Exception as exc:
+                message = str(exc).lower()
+                if "already running" in message or "capture is already running" in message:
+                    self.log_message("DXcam camera is already running; reusing active capture instead of starting it twice.")
+                    return True
+                raise
+
+    def get_dxcam_frame_safely(self, camera, allow_grab=False):
+        """Берёт один кадр DXcam под общим lock. Возвращает None при ошибке."""
+        if camera is None:
+            return None
+        with self.dxcam_camera_io_lock:
+            frame = None
+            try:
+                frame = camera.get_latest_frame()
+            except Exception as exc:
+                self.log_message(f"DXcam get_latest_frame ignored: {exc}")
+                frame = None
+            if frame is None and allow_grab:
+                try:
+                    frame = camera.grab()
+                except Exception as exc:
+                    self.log_message(f"DXcam grab ignored: {exc}")
+                    frame = None
+            return frame
+
+    def get_dxcam_recording_frame_fast(self, camera):
+        """Быстро берёт кадр в потоке записи без глобального lifecycle-lock.
+
+        Рывки в сохранённом видео появлялись, когда поток записи на каждом
+        кадре ждал общий dxcam_camera_io_lock. Этот же lock мог держать фоновый
+        release/stop старой DXcam-камеры после предыдущего старта. В итоге
+        get_latest_frame() задерживался рывками, а rawvideo-поток получал кадры
+        неравномерно. После передачи камеры записи она принадлежит только
+        dxcam_capture_loop, поэтому читать latest frame можно напрямую.
+        """
+        if camera is None:
+            return None
+        try:
+            return camera.get_latest_frame()
+        except Exception as exc:
+            try:
+                self.log_message(f"DXcam recording get_latest_frame ignored: {exc}")
+            except Exception:
+                pass
+            return None
+
+    def wait_for_dxcam_frame(self, camera, timeout=0.8):
+        """Ждёт первый кадр у уже запущенной DXcam-камеры без camera.grab().
+
+        grab() на некоторых системах подвисает на старом singleton-объекте DXcam.
+        Для видеорежима достаточно дождаться get_latest_frame(), поэтому старт
+        больше не блокирует GUI на неопределённое время.
+        """
+        deadline = time.perf_counter() + max(0.05, float(timeout or 0.8))
+        frame = None
+        while time.perf_counter() < deadline:
+            frame = self.get_dxcam_frame_safely(camera, allow_grab=False)
+            if frame is not None:
+                return frame
+            time.sleep(0.015)
+        return None
+
+    def ensure_frame_is_copy(self, frame):
+        if frame is None:
+            return None
+        try:
+            return frame.copy()
+        except Exception:
+            return frame
+
+    def append_timing_guard_frame(self, frames, click_perf, handoff_perf, fallback_frame=None):
+        """Не даёт первым секундам схлопнуться, если буфер был пустой/разреженный.
+
+        FFmpeg получает rawvideo с постоянным FPS. Если после клика есть только
+        один кадр, а подготовка заняла 1–2 секунды, без guard-кадра видео сразу
+        перескакивает к живому кадру и выглядит так, будто начало не записалось.
+        Добавляем последний известный кадр с timestamp handoff — цикл записи
+        восстановит длительность дублированием по timestamp.
+        """
+        try:
+            fps_int = self.get_recording_fps_int()
+        except Exception:
+            fps_int = 60
+        frame_interval = 1.0 / max(1, fps_int)
+        handoff_perf = float(handoff_perf or time.perf_counter())
+        click_perf = float(click_perf or handoff_perf)
+        if not frames:
+            if fallback_frame is None:
+                return []
+            frames = [(click_perf, fallback_frame, self.get_cursor_position())]
+        try:
+            first_ts = float(frames[0][0])
+            last_ts = float(frames[-1][0])
+        except Exception:
+            first_ts = click_perf
+            last_ts = click_perf
+        expected_span = max(0.0, handoff_perf - click_perf)
+        actual_span = max(0.0, last_ts - first_ts)
+        if expected_span > max(0.25, frame_interval * 3) and actual_span + frame_interval * 2 < expected_span:
+            last_frame = frames[-1][1] if frames else fallback_frame
+            last_cursor = frames[-1][2] if frames else self.get_cursor_position()
+            if last_frame is not None:
+                frames = list(frames)
+                frames.append((handoff_perf, last_frame, last_cursor))
+        return frames
+
+    def start_background_preparation(self):
+        """Прогрев FFmpeg в фоне, без DXcam-буфера.
+
+        DXcam-буфер специально не запускаем: именно он создавал второй поток,
+        который держал singleton-камеру и затем мог подвесить старт записи.
+        """
+        if not self.running:
+            return
+        if self._preflight_thread is None or not self._preflight_thread.is_alive():
+            self.diagnostic_log("preflight_thread_start_requested")
+            self._preflight_thread = threading.Thread(target=self.preflight_worker, daemon=True)
+            self._preflight_thread.start()
+
+    def preflight_worker(self):
+        """Заранее проверяем FFmpeg/NVENC/ddagrab, чтобы не делать это при старте."""
+        self.diagnostic_log("preflight_worker_start")
+        try:
+            self.run_managed_process([self.ffmpeg_path, "-version"], capture_output=True, text=True, timeout=5, creationflags=self.creation_flags())
+            self._ffmpeg_ok_cache = True
+        except Exception:
+            self._ffmpeg_ok_cache = False
+            self.diagnostic_log("preflight_worker_ffmpeg_failed", {"ffmpeg_path": self.ffmpeg_path}, level="ERROR")
+            return
+        try:
+            self.ffmpeg_supports_encoder("h264_nvenc")
+        except Exception:
+            pass
+        ddagrab_ok = False
+        try:
+            ddagrab_ok = bool(self.ffmpeg_supports_filter("ddagrab"))
+        except Exception:
+            pass
+        if ddagrab_ok:
+            self.warm_ddagrab_capture()
+        try:
+            self.ffmpeg_supports_input_format("wasapi")
+        except Exception:
+            pass
+        self.diagnostic_log("preflight_worker_finish", {
+            "ffmpeg_ok": self._ffmpeg_ok_cache,
+            "encoder_support_cache": self._encoder_support_cache,
+            "filter_support_cache": self._filter_support_cache,
+            "input_format_support_cache": self._input_format_support_cache,
+        })
+
+    def wait_for_preflight_caches(self, timeout=1.2):
+        """Коротко ждёт фоновые проверки FFmpeg, не замораживая окно.
+
+        Если пользователь нажал «Запись» сразу после запуска программы, кэш
+        поддержки NVENC/WASAPI/ddagrab может ещё быть пустым. Раньше в такой
+        момент программа могла ошибочно перейти на CPU-кодирование или Python
+        CoreAudio loopback. Здесь даём preflight небольшой шанс закончиться и
+        прокачиваем Tk-цикл, чтобы окно не выглядело зависшим.
+        """
+        try:
+            if self._preflight_thread is None or not self._preflight_thread.is_alive():
+                return
+            deadline = time.perf_counter() + max(0.0, float(timeout or 0.0))
+            while time.perf_counter() < deadline and self._preflight_thread.is_alive():
+                try:
+                    self.root.update()
+                except Exception:
+                    break
+                time.sleep(0.02)
+        except Exception as exc:
+            self.log_exception("wait_for_preflight_caches", exc)
+
+    def warm_ddagrab_capture(self):
+        """Коротко прогревает Desktop Duplication в фоне, чтобы первый реальный старт был ровнее."""
+        if os.name != "nt" or self._ddagrab_warm_done:
+            return False
+        self._ddagrab_warm_done = True
+        command = [
+            self.ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "ddagrab=framerate=60:draw_mouse=0:output_idx=0:dup_frames=1",
+            "-vf",
+            "hwdownload,format=bgra",
+            "-frames:v",
+            "2",
+            "-f",
+            "null",
+            "-",
+        ]
+        try:
+            self.diagnostic_log("ddagrab_warmup_start", {"command": self.command_to_log_text(command)})
+            result = self.run_managed_process(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=6,
+                creationflags=self.creation_flags(),
+                expected_returncodes=(0,),
+            )
+            ok = result.returncode == 0
+            self.diagnostic_log(
+                "ddagrab_warmup_finish",
+                {"returncode": result.returncode, "stderr": (result.stderr or "").strip()},
+                level="INFO" if ok else "WARN",
+            )
+            return ok
+        except Exception as exc:
+            self.diagnostic_log("ddagrab_warmup_failed", {
+                "error": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            }, level="WARN")
+            return False
+
+    def disable_dxcam_for_session(self, reason=""):
+        """Отключает DXcam до перезапуска программы после зависания/гонки.
+
+        У dxcam есть внутренний singleton. Если он однажды застрял между
+        фоновым буфером и стартом записи, самый безопасный путь — больше не
+        трогать его в этой сессии и использовать FFmpeg-захват.
+        """
+        self.dxcam_disabled_for_session = True
+        self.dxcam_disabled_reason = str(reason or "DXcam временно отключён из-за сбоя старта.")
+        try:
+            self.log_message(f"DXcam disabled for this session: {self.dxcam_disabled_reason}")
+        except Exception:
+            pass
+        try:
+            self.stop_instant_dxcam_buffer(release_camera=True, join_timeout=0.03)
+        except Exception:
+            pass
+
+    def get_safe_ffmpeg_fallback_backend(self):
+        """Возвращает безопасный FFmpeg-захват без долгой проверки в GUI."""
+        try:
+            if self._filter_support_cache.get("ddagrab") is True:
+                return "ddagrab"
+        except Exception:
+            pass
+        # gdigrab старее и медленнее, но почти всегда доступен в Windows-FFmpeg
+        # и не требует DXcam singleton. Это аварийный стабильный путь.
+        return "gdigrab"
+
+    def should_keep_instant_dxcam_buffer(self):
+        # Stable build: never start the DXcam warm buffer. Even an idle DXcam
+        # singleton can keep a stale capture object and freeze the next Start.
+        return False
+
+    def start_instant_dxcam_buffer(self):
+        """DXcam warm buffer is disabled in the stable build."""
+        try:
+            if self.instant_buffer_stop_event:
+                self.instant_buffer_stop_event.set()
+        except Exception:
+            pass
+        return
+
+    def stop_instant_dxcam_buffer(self, release_camera=True, join_timeout=0.25):
+        """Останавливает горячий DXcam-буфер без блокировки GUI.
+
+        Важный момент: если поток буфера ещё жив, нельзя отцеплять и release()
+        его камеру из другого потока. Иначе получалась гонка: один поток висит в
+        get_latest_frame(), второй пытается stop/release того же singleton — после
+        этого повторный старт с плавающей панели мог подвесить Tkinter.
+        """
+        try:
+            if self.instant_buffer_stop_event:
+                self.instant_buffer_stop_event.set()
+        except Exception:
+            pass
+
+        thread = self.instant_buffer_thread
+        gui_thread = False
+        try:
+            gui_ident = getattr(self, "gui_thread_ident", None)
+            gui_thread = gui_ident is not None and threading.get_ident() == gui_ident
+        except Exception:
+            gui_thread = False
+
+        # Из GUI-потока не ждём DXcam вообще: максимум даём микрошанс на быстрый
+        # выход. Всё остальное буферный поток сделает сам в finally.
+        effective_timeout = float(join_timeout or 0.0)
+        if gui_thread:
+            effective_timeout = min(effective_timeout, 0.03)
+
+        if thread is not None and thread.is_alive() and effective_timeout > 0:
+            try:
+                thread.join(timeout=effective_timeout)
+            except Exception:
+                pass
+
+        thread_alive = bool(thread is not None and thread.is_alive())
+        if thread_alive:
+            try:
+                self.log_message("Instant DXcam buffer stop requested; thread is still finishing in background.")
+            except Exception:
+                pass
+            return
+
+        self.instant_buffer_thread = None
+        self.instant_buffer_stop_event = None
+
+        if release_camera:
+            with self.instant_buffer_lock:
+                camera = self.instant_buffer_camera
+                self.instant_buffer_camera = None
+                self.instant_buffer_ready = False
+                self.instant_buffer_frames = []
+            self.release_dxcam_camera_safely(camera, label="instant_buffer_camera")
+        else:
+            with self.instant_buffer_lock:
+                self.instant_buffer_ready = False
+                self.instant_buffer_frames = []
+
+    def instant_dxcam_buffer_loop(self, stop_event):
+        camera = None
+        try:
+            fps_int = self.get_recording_fps_int()
+            camera = self.create_dxcam_camera_safely()
+            self.safe_start_dxcam_camera(camera, fps_int)
+            with self.instant_buffer_lock:
+                self.instant_buffer_camera = camera
+                self.instant_buffer_ready = True
+                self.instant_buffer_last_error = None
+                self.instant_buffer_frames = []
+
+            frame_interval = 1.0 / max(1, fps_int)
+            while not stop_event.is_set() and self.should_keep_instant_dxcam_buffer():
+                loop_started = time.perf_counter()
+                frame = self.get_dxcam_frame_safely(camera, allow_grab=False)
+
+                if frame is not None:
+                    # Копия нужна обязательно: DXcam может переиспользовать буфер кадра.
+                    if not frame.flags["C_CONTIGUOUS"]:
+                        frame = frame.copy()
+                    else:
+                        frame = frame.copy()
+                    cursor_pos = self.get_cursor_position()
+                    now = time.perf_counter()
+                    with self.instant_buffer_lock:
+                        self.instant_buffer_frames.append((now, frame, cursor_pos))
+                        self.prune_instant_buffer_frames_locked(now, latest_frame=frame)
+
+                spent = time.perf_counter() - loop_started
+                time.sleep(max(0.001, min(0.02, frame_interval - spent)))
+        except Exception as exc:
+            with self.instant_buffer_lock:
+                self.instant_buffer_last_error = str(exc)
+                self.instant_buffer_ready = False
+        finally:
+            # Если камера была передана записи, self.instant_buffer_camera уже не она —
+            # тогда не останавливаем её здесь, запись сама освободит камеру.
+            should_release = False
+            with self.instant_buffer_lock:
+                if self.instant_buffer_camera is camera:
+                    self.instant_buffer_camera = None
+                    self.instant_buffer_ready = False
+                    should_release = True
+            if should_release and camera is not None:
+                self.release_dxcam_camera_safely(camera, label="instant_buffer_finally_camera")
+
+    def get_instant_buffer_snapshot(self):
+        with self.instant_buffer_lock:
+            camera = self.instant_buffer_camera
+            frames = list(self.instant_buffer_frames)
+            ready = self.instant_buffer_ready
+            error = self.instant_buffer_last_error
+        return camera, frames, ready, error
+
+    def take_instant_buffer_for_recording(self):
+        """Безопасно передаёт прогретую DXcam-камеру записи.
+
+        Если буферный поток не завершился быстро, камеру НЕ используем для
+        записи. Это важнее мгновенного DXcam-старта: зависший/полуживой поток
+        DXcam мог держать внутренний lock/singleton, и повторный старт с
+        плавающей панели превращался в «Python не отвечает». В такой ситуации
+        start_dxcam_segment поднимет fallback на ddagrab/gdigrab.
+        """
+        stop_event = self.instant_buffer_stop_event
+        try:
+            if stop_event:
+                stop_event.set()
+        except Exception as exc:
+            self.log_exception("take_instant_buffer_for_recording.set_stop", exc)
+
+        # Сначала отсоединяем камеру от self.instant_buffer_camera, чтобы finally
+        # буферного потока не освободил её, если поток успел корректно выйти.
+        with self.instant_buffer_lock:
+            camera = self.instant_buffer_camera
+            frames = list(self.instant_buffer_frames)
+            self.instant_buffer_camera = None
+            self.instant_buffer_ready = False
+            self.instant_buffer_frames = []
+
+        thread = self.instant_buffer_thread
+        thread_alive = False
+        if thread is not None and thread.is_alive():
+            try:
+                thread.join(timeout=0.25)
+            except Exception as exc:
+                self.log_exception("take_instant_buffer_for_recording.join", exc)
+            thread_alive = bool(thread.is_alive())
+
+        if thread_alive:
+            self.log_message("Instant DXcam buffer did not stop fast enough; refusing to reuse its camera and falling back safely.")
+
+            def release_later(cam=camera, th=thread):
+                try:
+                    th.join(timeout=5.0)
+                except Exception:
+                    pass
+                try:
+                    if th.is_alive():
+                        self.log_message("Instant DXcam buffer thread is still stuck; camera release skipped to avoid deadlock.")
+                        return
+                except Exception:
+                    pass
+                self.release_dxcam_camera_safely(cam, label="instant_buffer_handoff_aborted_camera")
+
+            if camera is not None:
+                try:
+                    threading.Thread(target=release_later, name="release_aborted_dxcam_handoff", daemon=True).start()
+                except Exception:
+                    pass
+            return None, frames
+
+        self.instant_buffer_thread = None
+        self.instant_buffer_stop_event = None
+        return camera, frames
+
+    def prune_instant_buffer_frames_locked(self, now, latest_frame=None):
+        """Ограничивает горячий DXcam-буфер по времени, кадрам и памяти.
+
+        Функция вызывается уже под self.instant_buffer_lock. В обычном режиме
+        буфер хранит короткую историю. В момент запуска записи важно не удалить
+        кадры, снятые сразу после клика, пока FFmpeg ещё открывается, поэтому
+        ориентируемся на recording_start_requested_perf и оставляем окно от
+        клика до текущего момента, но при нехватке памяти прореживаем кадры
+        равномерно, а не просто выбрасываем самое старое начало.
+        """
+        frames = self.instant_buffer_frames
+        if not frames:
+            return
+        try:
+            fps_int = self.get_recording_fps_int()
+        except Exception:
+            fps_int = 60
+        click_perf = None
+        try:
+            if self.recording_start_requested_perf and (now - self.recording_start_requested_perf) <= 6.0:
+                click_perf = float(self.recording_start_requested_perf)
+        except Exception:
+            click_perf = None
+
+        cutoff = now - float(getattr(self, "instant_buffer_max_seconds", 3.0))
+        if click_perf is not None:
+            cutoff = min(cutoff, click_perf - (1.0 / max(1, fps_int)))
+        while frames and frames[0][0] < cutoff:
+            frames.pop(0)
+
+        max_frames = int(getattr(self, "instant_buffer_max_frames", 120) or 120)
+        try:
+            frame_bytes = int(getattr(latest_frame, "nbytes", 0) or (frames[-1][1].nbytes if frames else 0))
+            max_bytes = int(getattr(self, "instant_buffer_max_bytes", 420 * 1024 * 1024) or 0)
+            if frame_bytes > 0 and max_bytes > 0:
+                max_frames = min(max_frames, max(6, max_bytes // frame_bytes))
+        except Exception:
+            pass
+        max_frames = max(6, int(max_frames))
+
+        if len(frames) <= max_frames:
+            return
+        if click_perf is None:
+            del frames[:-max_frames]
+            return
+
+        # При старте записи прореживаем равномерно, чтобы не потерять именно
+        # первые кадры после клика. Поток записи потом восстановит длительность
+        # дублированием ближайших кадров по их timestamp.
+        n = len(frames)
+        if max_frames <= 1:
+            self.instant_buffer_frames = [frames[-1]]
+            return
+        keep = sorted({round(i * (n - 1) / (max_frames - 1)) for i in range(max_frames)})
+        self.instant_buffer_frames = [frames[i] for i in keep]
+
+    def select_frames_from_click(self, buffered_frames, click_perf, fallback_frame=None):
+        """Берём из буфера кадры начиная максимально близко к нажатию Start."""
+        if not buffered_frames:
+            if fallback_frame is None:
+                return []
+            return [(click_perf, fallback_frame, self.get_cursor_position())]
+        fps_int = self.get_recording_fps_int()
+        tolerance = 0.5 / max(1, fps_int)
+        selected = [item for item in buffered_frames if item[0] >= click_perf - tolerance]
+        if selected:
+            return selected
+        before = [item for item in buffered_frames if item[0] < click_perf]
+        if before:
+            return [before[-1]]
+        return [buffered_frames[-1]]
+
+    def check_disk_space_or_warn(self, min_minutes=2):
+        """Предупреждает, если на диске мало места под выбранный битрейт.
+
+        Оцениваем расход как (видео+аудио битрейт) и требуем запас хотя бы на
+        min_minutes минут. Если мало — спрашиваем, продолжать ли.
+        """
+        try:
+            mbps = normalize_video_bitrate_mbps(self.video_bitrate_var.get(), default=16)
+            audio_k = 192
+            try:
+                audio_k = int(re.sub(r"\D", "", self.audio_bitrate_var.get()) or "192")
+            except Exception:
+                pass
+            bytes_per_min = (mbps * 1_000_000 + audio_k * 1000) / 8 * 60
+            need = bytes_per_min * min_minutes
+        except Exception:
+            return True
+
+        try:
+            output_folder = Path(self.output_folder.get().strip() or os.getcwd()).expanduser()
+            output_folder.mkdir(parents=True, exist_ok=True)
+            temp_folder = self.get_recording_temp_root()
+            targets = [
+                ("временные сегменты", Path(temp_folder)),
+                ("готовое видео", output_folder),
+            ]
+            checked_volumes = set()
+            low_space = []
+            for label, folder in targets:
+                folder.mkdir(parents=True, exist_ok=True)
+                try:
+                    volume_key = Path(folder.resolve(strict=False)).anchor.lower() or str(folder)
+                except Exception:
+                    volume_key = str(folder)
+                if volume_key in checked_volumes:
+                    continue
+                checked_volumes.add(volume_key)
+                free = shutil.disk_usage(folder).free
+                if free < need:
+                    low_space.append((label, folder, free))
+        except Exception as exc:
+            self.diagnostic_log(
+                "disk_space_check_failed",
+                {"error": repr(exc)},
+                level="WARN",
+            )
+            return True  # не смогли проверить — не мешаем записи
+
+        if not low_space:
+            return True
+        need_mb = int(need / (1024 * 1024))
+        details = "\n".join(
+            f"• {label}: {folder} — свободно ~{int(free / (1024 * 1024))} МБ"
+            for label, folder, free in low_space
+        )
+        return messagebox.askyesno(
+            "Мало места на диске",
+            f"Недостаточно места для записи:\n{details}\n\n"
+            f"При битрейте ~{mbps} Мбит/с для {min_minutes} мин нужно минимум ~{need_mb} МБ.\n\n"
+            "Всё равно начать запись?",
+        )
+
+    def run_start_countdown(self, seconds=3):
+        """Большой отсчёт 3-2-1 по центру экрана перед стартом записи."""
+        try:
+            if not self.countdown_enabled_var.get():
+                return
+        except Exception:
+            return
+        try:
+            top = tk.Toplevel(self.root)
+            top.overrideredirect(True)
+            top.attributes("-topmost", True)
+            try:
+                top.attributes("-alpha", 0.85)
+            except Exception:
+                pass
+            lbl = tk.Label(top, text=str(seconds), font=("Segoe UI", 110, "bold"), fg="white", bg="black")
+            lbl.pack(padx=60, pady=30)
+            top.update_idletasks()
+            sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+            w, h = top.winfo_width(), top.winfo_height()
+            top.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+            for n in range(seconds, 0, -1):
+                lbl.config(text=str(n))
+                end = time.perf_counter() + 1.0
+                while time.perf_counter() < end:
+                    try:
+                        top.update()
+                    except Exception:
+                        break
+                    time.sleep(0.02)
+            top.destroy()
+        except Exception as exc:
+            self.log_exception("run_start_countdown", exc)
+
+    def schedule_auto_stop(self):
+        self.cancel_auto_stop()
+        try:
+            raw = str(self.auto_stop_minutes_var.get()).strip().replace(",", ".")
+            minutes = float(raw or "0")
+        except Exception:
+            minutes = 0
+        if minutes > 0:
+            try:
+                self._auto_stop_after_id = self.root.after(int(minutes * 60_000), self._auto_stop_trigger)
+            except Exception:
+                self._auto_stop_after_id = None
+
+    def cancel_auto_stop(self):
+        after_id = getattr(self, "_auto_stop_after_id", None)
+        if after_id:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self._auto_stop_after_id = None
+
+    def _auto_stop_trigger(self):
+        self._auto_stop_after_id = None
+        if self.is_recording and not self.is_finalizing:
+            try:
+                self.status_var.set("Авто-остановка по таймеру.")
+            except Exception:
+                pass
+            self.stop_recording()
+
+    def _region_label(self):
+        r = getattr(self, "capture_region", None)
+        if r and len(r) == 4:
+            return f"Область {int(r[2])}×{int(r[3])} @ ({int(r[0])},{int(r[1])})"
+        return "Весь экран"
+
+    @staticmethod
+    def normalize_capture_region_drag(start_x, start_y, end_x, end_y, minimum_size=16):
+        """Нормализует выделение в координатах виртуального рабочего стола."""
+        start_x = int(start_x)
+        start_y = int(start_y)
+        end_x = int(end_x)
+        end_y = int(end_y)
+        minimum_size = max(1, int(minimum_size))
+        x = min(start_x, end_x)
+        y = min(start_y, end_y)
+        width = abs(end_x - start_x)
+        height = abs(end_y - start_y)
+        selected = width >= minimum_size and height >= minimum_size
+        details = {
+            "status": "selected" if selected else "too_small",
+            "start": [start_x, start_y],
+            "end": [end_x, end_y],
+            "width": width,
+            "height": height,
+            "minimum_size": minimum_size,
+        }
+        region = [x, y, width, height] if selected else None
+        return region, details
+
+    def select_capture_region(
+        self,
+        on_done=None,
+        allow_while_recording=False,
+        hint_text=None,
+        on_result=None,
+        purpose="recording",
+        background_image=None,
+        screen_rect=None,
+    ):
+        """Полноэкранный выбор прямоугольной области мышью.
+
+        Старый callback on_done(region) сохраняется для совместимости.
+        Новый on_result(region, details) дополнительно получает точную причину
+        результата, координаты и длительность выбора для диагностики.
+        Координаты берутся в пикселях виртуального рабочего стола, поэтому выбор
+        работает и на мультимониторных конфигурациях, включая мониторы с
+        отрицательными координатами Windows. Для скриншота выбор можно разрешить
+        во время записи через allow_while_recording=True.
+        """
+        purpose = str(purpose or "recording")
+        selector_started = time.perf_counter()
+        done_called = {"v": False}
+
+        def finish(region=None, status="cancelled", details=None):
+            if done_called["v"]:
+                return
+            done_called["v"] = True
+            result = {
+                "purpose": purpose,
+                "status": str(status or "cancelled"),
+                "region": list(region) if region else None,
+                "elapsed_sec": round(time.perf_counter() - selector_started, 3),
+            }
+            if isinstance(details, dict):
+                result.update(details)
+                result["purpose"] = purpose
+                result["status"] = str(status or details.get("status") or "cancelled")
+                result["region"] = list(region) if region else None
+            level = "WARN" if result["status"] in {"selector_error", "release_without_press"} else "INFO"
+            self.diagnostic_log("capture_region_selection_finished", result, level=level)
+            try:
+                if on_result:
+                    on_result(region, result)
+                elif on_done:
+                    on_done(region)
+            except Exception as exc:
+                self.log_exception("capture_region_result_callback", exc)
+
+        if getattr(self, "is_recording", False) and not allow_while_recording:
+            messagebox.showinfo("Область", "Нельзя менять область во время записи.")
+            finish(status="blocked_while_recording")
+            return
+
+        sel = None
+        try:
+            sel = tk.Toplevel(self.root)
+            if screen_rect is None:
+                vx, vy, vw, vh = self.get_virtual_screen_rect()
+            else:
+                vx, vy, vw, vh = [int(value) for value in screen_rect]
+            sel.overrideredirect(True)
+            sel.geometry(f"{vw}x{vh}{vx:+d}{vy:+d}")
+            if background_image is None:
+                try:
+                    sel.attributes("-alpha", 0.3)
+                except Exception:
+                    pass
+            sel.attributes("-topmost", True)
+            canvas = tk.Canvas(sel, cursor="cross", bg="gray20", highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+            background_mode = "live_transparent_overlay"
+            if background_image is not None:
+                if ImageTk is None or Image is None:
+                    raise RuntimeError("Pillow ImageTk недоступен для показа сохранённого кадра.")
+                display_image = background_image
+                resized_display_image = None
+                if tuple(background_image.size) != (int(vw), int(vh)):
+                    resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+                    resized_display_image = background_image.resize((int(vw), int(vh)), resampling)
+                    display_image = resized_display_image
+                try:
+                    background_photo = ImageTk.PhotoImage(display_image, master=sel)
+                finally:
+                    if resized_display_image is not None:
+                        resized_display_image.close()
+                sel._capture_background_photo = background_photo
+                canvas.create_image(0, 0, image=background_photo, anchor="nw")
+                canvas.create_rectangle(
+                    0,
+                    0,
+                    int(vw),
+                    int(vh),
+                    fill="black",
+                    outline="",
+                    stipple="gray50",
+                )
+                background_mode = "frozen_snapshot_before_selector_focus"
+            # Подсказка является элементом Canvas, а не отдельным Label. Поэтому
+            # она больше не перехватывает ButtonPress и не создаёт мёртвую зону.
+            hint_item = canvas.create_text(
+                int(vw / 2),
+                24,
+                text=hint_text or "Выдели область для записи мышью.  Esc — отмена.",
+                fill="white",
+                font=("Segoe UI", 13, "bold"),
+                anchor="n",
+                justify="center",
+            )
+            hint_bounds = canvas.bbox(hint_item)
+            if hint_bounds:
+                left, top, right, bottom = hint_bounds
+                hint_background = canvas.create_rectangle(
+                    left - 12,
+                    top - 6,
+                    right + 12,
+                    bottom + 6,
+                    fill="black",
+                    outline="",
+                )
+                canvas.tag_lower(hint_background, hint_item)
+            state = {"sx": 0, "sy": 0, "cx": 0, "cy": 0, "rect": None, "pressed": False}
+
+            def close(status="escape"):
+                try:
+                    sel.destroy()
+                except Exception:
+                    pass
+                finish(status=status)
+
+            def on_press(event):
+                state["sx"], state["sy"] = event.x_root, event.y_root
+                state["cx"], state["cy"] = event.x, event.y
+                state["pressed"] = True
+                if state["rect"]:
+                    canvas.delete(state["rect"])
+                state["rect"] = canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="#ff3b3b", width=2)
+                self.diagnostic_log("capture_region_selection_started", {
+                    "purpose": purpose,
+                    "start": [int(event.x_root), int(event.y_root)],
+                    "minimum_size": 16,
+                })
+
+            def on_drag(event):
+                if state["pressed"] and state["rect"]:
+                    canvas.coords(state["rect"], state["cx"], state["cy"], event.x, event.y)
+
+            def on_release(event):
+                if not state["pressed"]:
+                    close(status="release_without_press")
+                    return
+                state["pressed"] = False
+                region, details = self.normalize_capture_region_drag(
+                    state["sx"],
+                    state["sy"],
+                    event.x_root,
+                    event.y_root,
+                    minimum_size=16,
+                )
+                try:
+                    sel.destroy()
+                except Exception:
+                    pass
+                finish(region, status=details["status"], details=details)
+
+            canvas.bind("<ButtonPress-1>", on_press)
+            canvas.bind("<B1-Motion>", on_drag)
+            canvas.bind("<ButtonRelease-1>", on_release)
+            sel.bind("<Escape>", lambda _event: close(status="escape"))
+            sel.update_idletasks()
+            self.diagnostic_log("capture_region_selector_opened", {
+                "purpose": purpose,
+                "virtual_screen": [int(vx), int(vy), int(vw), int(vh)],
+                "minimum_size": 16,
+                "hint_widget": "canvas_item",
+                "mouse_event_surface": "fullscreen_canvas",
+                "background_mode": background_mode,
+                "background_image_size": (
+                    [int(background_image.size[0]), int(background_image.size[1])]
+                    if background_image is not None else None
+                ),
+                "focus_effect": (
+                    "transient_panels_preserved_in_frozen_snapshot"
+                    if background_image is not None else "live_desktop_may_change_on_focus"
+                ),
+            })
+            try:
+                overlay = getattr(self, "annotation_overlay", None)
+                if overlay is not None:
+                    overlay.make_window_not_recorded(sel)
+            except Exception:
+                pass
+            try:
+                sel.grab_set()
+                sel.focus_force()
+            except Exception:
+                pass
+        except Exception as exc:
+            if sel is not None:
+                try:
+                    sel.destroy()
+                except Exception:
+                    pass
+            self.log_exception("select_capture_region", exc)
+            finish(status="selector_error", details={"error": repr(exc)})
+
+    def start_keys_overlay(self):
+        """Экранный оверлей последних нажатых клавиш (для обучающих видео).
+
+        Это обычное topmost-окно, поэтому ddagrab/gdigrab захватывают его прямо
+        в видео. Глобальный хук keyboard работает в своём потоке — обновляем GUI
+        строго через root.after.
+        """
+        try:
+            if not self.show_keys_overlay_var.get() or not HOTKEY_AVAILABLE:
+                return
+            import keyboard as _kb
+            ov = tk.Toplevel(self.root)
+            ov.overrideredirect(True)
+            ov.attributes("-topmost", True)
+            try:
+                ov.attributes("-alpha", 0.8)
+            except Exception:
+                pass
+            ov.configure(bg="black")
+            lbl = tk.Label(ov, text="", font=("Consolas", 22, "bold"), fg="white", bg="black", padx=18, pady=8)
+            lbl.pack()
+            ov.withdraw()
+            self._keys_overlay = ov
+            self._keys_overlay_label = lbl
+            self._keys_recent = []
+
+            def on_key(event):
+                try:
+                    name = getattr(event, "name", "") or ""
+                    if name:
+                        self.root.after(0, lambda n=name: self._push_key(n))
+                except Exception:
+                    pass
+
+            self._keys_hook = _kb.on_press(on_key)
+        except Exception as exc:
+            self.log_exception("start_keys_overlay", exc)
+
+    def _push_key(self, name):
+        try:
+            if not self._keys_overlay:
+                return
+            pretty = name.upper() if len(name) == 1 else name
+            self._keys_recent.append(pretty)
+            self._keys_recent = self._keys_recent[-6:]
+            self._keys_overlay_label.config(text="   ".join(self._keys_recent))
+            ov = self._keys_overlay
+            ov.update_idletasks()
+            sw, sh = ov.winfo_screenwidth(), ov.winfo_screenheight()
+            w, h = ov.winfo_width(), ov.winfo_height()
+            ov.geometry(f"+{(sw - w) // 2}+{sh - h - 80}")
+            ov.deiconify()
+            ov.lift()
+            self._keys_clear_at = time.perf_counter() + 1.5
+            self.root.after(1600, self._maybe_clear_keys)
+        except Exception:
+            pass
+
+    def _maybe_clear_keys(self):
+        try:
+            if self._keys_overlay and time.perf_counter() >= getattr(self, "_keys_clear_at", 0):
+                self._keys_recent = []
+                self._keys_overlay_label.config(text="")
+                self._keys_overlay.withdraw()
+        except Exception:
+            pass
+
+    def make_window_clickthrough(self, window):
+        """Делает оверлей некликабельным для мыши на Windows."""
+        if os.name != "nt" or window is None:
+            return
+        try:
+            window.update_idletasks()
+            hwnd = int(window.winfo_id())
+            user32 = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_TOOLWINDOW = 0x00000080
+            get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+            set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            get_long.restype = ctypes.c_ssize_t
+            set_long.restype = ctypes.c_ssize_t
+            style = get_long(hwnd, GWL_EXSTYLE)
+            set_long(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)
+        except Exception:
+            pass
+
+    def start_cursor_highlight_overlay(self):
+        """Видимая подсветка курсора для FFmpeg-захвата.
+
+        FFmpeg ddagrab/gdigrab умеет рисовать обычный курсор, но не умеет сам
+        рисовать круг вокруг него. Поэтому создаём маленькое прозрачное окно,
+        которое следует за мышью и попадает в запись как обычный topmost overlay.
+        """
+        try:
+            if not self.cursor_highlight_var.get():
+                return
+            self.stop_cursor_highlight_overlay()
+            size = max(20, min(240, int(self.cursor_highlight_size_var.get())))
+            transparent = "#ff00ff"
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            win.configure(bg=transparent)
+            try:
+                win.wm_attributes("-transparentcolor", transparent)
+            except Exception:
+                pass
+            canvas = tk.Canvas(win, width=size, height=size, bg=transparent, highlightthickness=0, bd=0)
+            canvas.pack(fill="both", expand=True)
+            pad = max(2, int(size * 0.08))
+            width = max(2, int(size * 0.08))
+            canvas.create_oval(pad, pad, size - pad, size - pad, outline="yellow", width=width)
+            win.geometry(f"{size}x{size}+0+0")
+            self.make_window_clickthrough(win)
+            self._cursor_highlight_window = win
+            self._cursor_highlight_canvas = canvas
+            self._update_cursor_highlight_overlay()
+        except Exception as exc:
+            self.log_exception("start_cursor_highlight_overlay", exc)
+
+    def _update_cursor_highlight_overlay(self):
+        try:
+            win = self._cursor_highlight_window
+            if not win or not self.is_recording or self.is_finalizing:
+                return
+            size = max(20, min(240, int(self.cursor_highlight_size_var.get())))
+            x, y = self.get_cursor_position()
+            win.geometry(f"{size}x{size}+{int(x - size / 2)}+{int(y - size / 2)}")
+            win.attributes("-topmost", True)
+            self._cursor_highlight_job = self.root.after(16, self._update_cursor_highlight_overlay)
+        except Exception:
+            try:
+                self._cursor_highlight_job = self.root.after(80, self._update_cursor_highlight_overlay)
+            except Exception:
+                self._cursor_highlight_job = None
+
+    def stop_cursor_highlight_overlay(self):
+        try:
+            if self._cursor_highlight_job is not None:
+                try:
+                    self.root.after_cancel(self._cursor_highlight_job)
+                except Exception:
+                    pass
+                self._cursor_highlight_job = None
+            if self._cursor_highlight_window is not None:
+                try:
+                    self._cursor_highlight_window.destroy()
+                except Exception:
+                    pass
+            self._cursor_highlight_window = None
+            self._cursor_highlight_canvas = None
+        except Exception:
+            pass
+
+    def stop_keys_overlay(self):
+        try:
+            if self._keys_hook is not None:
+                try:
+                    import keyboard as _kb
+                    _kb.unhook(self._keys_hook)
+                except Exception:
+                    pass
+                self._keys_hook = None
+            if self._keys_overlay is not None:
+                try:
+                    self._keys_overlay.destroy()
+                except Exception:
+                    pass
+                self._keys_overlay = None
+                self._keys_overlay_label = None
+        except Exception:
+            pass
