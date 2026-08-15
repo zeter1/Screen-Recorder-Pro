@@ -203,6 +203,62 @@ class AnnotationOverlay:
         except Exception:
             return 16
 
+    def get_work_area_for_position(self, x=None, y=None, size=None):
+        """Возвращает рабочую область ближайшего монитора без панели задач."""
+        screen_w = max(1, int(self.root.winfo_screenwidth()))
+        screen_h = max(1, int(self.root.winfo_screenheight()))
+        fallback = (0, 0, screen_w, screen_h)
+        if not self.is_windows():
+            return fallback
+        try:
+            class MonitorInfo(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD),
+                ]
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            user32.MonitorFromPoint.restype = wintypes.HANDLE
+            user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+            user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+            panel_size = max(1, int(size or self.bubble_size or 1))
+            point_x = int(x) + panel_size // 2 if x is not None else screen_w // 2
+            point_y = int(y) + panel_size // 2 if y is not None else screen_h // 2
+            monitor = user32.MonitorFromPoint(wintypes.POINT(point_x, point_y), 0x00000002)
+            info = MonitorInfo()
+            info.cbSize = ctypes.sizeof(MonitorInfo)
+            if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                work = info.rcWork
+                area = (int(work.left), int(work.top), int(work.right), int(work.bottom))
+                if area[2] > area[0] and area[3] > area[1]:
+                    return area
+        except Exception:
+            pass
+        return fallback
+
+    @staticmethod
+    def clamp_panel_position(x, y, size, work_area, padding=8):
+        """Не даёт плавающей кнопке уйти под taskbar или за край монитора."""
+        left, top, right, bottom = [int(value) for value in work_area]
+        size = max(1, int(size))
+        padding = max(0, int(padding))
+        min_x = left + padding
+        min_y = top + padding
+        max_x = right - size - padding
+        max_y = bottom - size - padding
+        if max_x < min_x:
+            min_x = max_x = left
+        if max_y < min_y:
+            min_y = max_y = top
+        return (
+            max(min_x, min(max_x, int(x))),
+            max(min_y, min(max_y, int(y))),
+        )
+
     def apply_bubble_size(self):
         """Применяет новый размер плавающей кнопки без пересоздания панели."""
         if not self.bubble:
@@ -212,10 +268,8 @@ class AnnotationOverlay:
             self.bubble.update_idletasks()
             x = int(self.bubble.winfo_rootx())
             y = int(self.bubble.winfo_rooty())
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
-            x = max(0, min(sw - size, x))
-            y = max(0, min(sh - size, y))
+            work_area = self.get_work_area_for_position(x, y, size)
+            x, y = self.clamp_panel_position(x, y, size, work_area)
             self.bubble.geometry(f"{size}x{size}+{x}+{y}")
             self.bubble_size = size
             if self.bubble_label:
@@ -248,9 +302,30 @@ class AnnotationOverlay:
             y = int(getattr(self.app, "settings", {}).get("floating_panel_y", default_y))
         except Exception:
             x, y = default_x, default_y
-        x = max(0, min(screen_w - size, x))
-        y = max(0, min(screen_h - size, y))
+        requested_x, requested_y = x, y
+        work_area = self.get_work_area_for_position(x, y, size)
+        x, y = self.clamp_panel_position(x, y, size, work_area)
         self.bubble.geometry(f"{size}x{size}+{x}+{y}")
+
+        position_clamped = (x, y) != (requested_x, requested_y)
+        try:
+            self.app.diagnostic_log("floating_panel_geometry_initialized", {
+                "requested_position": [requested_x, requested_y],
+                "actual_position": [x, y],
+                "size": size,
+                "work_area": list(work_area),
+                "position_clamped": position_clamped,
+                "reason": "keep_panel_outside_taskbar_and_inside_monitor_work_area",
+            }, level="WARN" if position_clamped else "INFO")
+        except Exception:
+            pass
+        if position_clamped:
+            try:
+                self.app.settings["floating_panel_x"] = x
+                self.app.settings["floating_panel_y"] = y
+                self.app.schedule_save_settings()
+            except Exception:
+                pass
 
         # Tkinter не умеет настоящий круг без усложнений, поэтому делаем компактную
         # тёмную кнопку. Индикатор должен быть виден поверх экрана и доступен
@@ -527,11 +602,10 @@ class AnnotationOverlay:
             by = self.bubble.winfo_rooty()
             tw = self.toolbar.winfo_reqwidth()
             th = self.toolbar.winfo_reqheight()
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
+            left, top, right, bottom = self.get_work_area_for_position(bx, by, max(bw, bh))
             # По умолчанию панель раскрывается левее и немного выше кружка.
-            x = min(max(8, bx + bw - tw), max(8, sw - tw - 8))
-            y = min(max(8, by - th - 8), max(8, sh - th - 8))
+            x = min(max(left + 8, bx + bw - tw), max(left + 8, right - tw - 8))
+            y = min(max(top + 8, by - th - 8), max(top + 8, bottom - th - 8))
             self.toolbar.geometry(f"{tw}x{th}+{x}+{y}")
         except Exception:
             pass
@@ -562,12 +636,10 @@ class AnnotationOverlay:
                 self._drag_moved = True
             x = self._drag_window_start[0] + dx
             y = self._drag_window_start[1] + dy
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
             bw = self.bubble.winfo_width() or self.bubble_size or 34
             bh = self.bubble.winfo_height() or self.bubble_size or 34
-            x = max(0, min(sw - bw, x))
-            y = max(0, min(sh - bh, y))
+            work_area = self.get_work_area_for_position(x, y, max(bw, bh))
+            x, y = self.clamp_panel_position(x, y, max(bw, bh), work_area)
             self.bubble.geometry(f"+{x}+{y}")
             if self.toolbar_visible:
                 self.place_toolbar_near_bubble()
@@ -593,6 +665,16 @@ class AnnotationOverlay:
             pass
         # Короткий клик по индикатору открывает панель, а перетаскивание только двигает индикатор.
         if not moved:
+            try:
+                self.app.diagnostic_log("floating_panel_clicked", {
+                    "position": [
+                        int(self.bubble.winfo_rootx()),
+                        int(self.bubble.winfo_rooty()),
+                    ] if self.bubble else None,
+                    "toolbar_was_visible": bool(self.toolbar_visible),
+                })
+            except Exception:
+                pass
             self.show_toolbar()
 
     def prevent_toolbar_close(self):

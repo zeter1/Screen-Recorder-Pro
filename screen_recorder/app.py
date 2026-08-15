@@ -224,6 +224,7 @@ class ScreenRecorderProWin11(
         self.hotkey_action_queue = queue.Queue()
         self.hotkey_handle = None
         self.screenshot_hotkey_handle = None
+        self.screenshot_hotkey_backup_handle = None
         self.screenshot_hotkey_backend = None
         self.native_screenshot_hotkey_thread = None
         self.native_screenshot_hotkey_thread_id = None
@@ -236,6 +237,8 @@ class ScreenRecorderProWin11(
         self.hotkey_callback_counts = {"record": 0, "screenshot": 0}
         self.hotkey_last_callback_perf = None
         self.hotkey_last_registration_perf = None
+        self.screenshot_hotkey_callback_lock = threading.Lock()
+        self.screenshot_hotkey_last_accepted_callback_perf = None
         # Временный глобальный перехват нужен для настройки горячей клавиши
         # простым нажатием. Поток библиотеки keyboard не обращается к Tkinter:
         # он только кладёт готовый результат в hotkey_action_queue.

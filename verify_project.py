@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import compileall
 import inspect
+import queue
 import sys
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -83,6 +85,7 @@ def main() -> int:
         "get_screenshot_snapshot_crop_box", "apply_screenshot_annotations",
         "parse_native_print_screen_hotkey", "_start_native_screenshot_hotkey",
         "_stop_native_screenshot_hotkey", "_is_native_screenshot_hotkey_healthy",
+        "_enqueue_screenshot_hotkey_from_backend",
         "_is_owned_problem_log_item",
     }
     missing = sorted(required - methods)
@@ -225,6 +228,78 @@ def main() -> int:
         return 1
     if "ready_event.wait" not in native_start_source or "_stop_native_screenshot_hotkey" not in native_start_source:
         print("ОШИБКА: результат нативной регистрации не подтверждается или старый поток не останавливается.")
+        return 1
+
+    from screen_recorder.components.annotation_overlay import AnnotationOverlay
+
+    panel_position = AnnotationOverlay.clamp_panel_position(
+        1894, 1042, 26, (0, 0, 1920, 1040), padding=8,
+    )
+    if panel_position != (1886, 1006):
+        print("ОШИБКА: плавающая панель не возвращается из-под панели задач в рабочую область.")
+        return 1
+
+    duplicate_app = object.__new__(ScreenRecorderProWin11)
+    duplicate_app._exiting = False
+    duplicate_app.screenshot_hotkey_callback_lock = threading.Lock()
+    duplicate_app.screenshot_hotkey_last_accepted_callback_perf = None
+    duplicate_app.hotkey_callback_counts = {"record": 0, "screenshot": 0}
+    duplicate_app.hotkey_registration_generation = 1
+    duplicate_app.screenshot_hotkey_backend = "windows_register_hotkey"
+    duplicate_app.native_screenshot_hotkey_thread_id = 123
+    duplicate_app.hotkey_action_queue = queue.Queue()
+    duplicate_events = []
+    duplicate_app.diagnostic_log = lambda event, data=None, level="INFO": duplicate_events.append(event)
+    if not duplicate_app._enqueue_screenshot_hotkey_from_backend("windows_register_hotkey"):
+        print("ОШИБКА: первый callback Print Screen ошибочно отклонён.")
+        return 1
+    if duplicate_app._enqueue_screenshot_hotkey_from_backend("keyboard_backup"):
+        print("ОШИБКА: резервный callback создаёт второй скриншот для одного нажатия.")
+        return 1
+    if duplicate_app.hotkey_action_queue.qsize() != 1 or "hotkey_callback_duplicate_ignored" not in duplicate_events:
+        print("ОШИБКА: дедупликация двух backend Print Screen не подтверждена диагностикой.")
+        return 1
+
+    class TrackedTkVar:
+        def __init__(self):
+            self.get_calls = 0
+
+        def get(self):
+            self.get_calls += 1
+            return "unexpected_tk_value"
+
+    background_log_app = object.__new__(ScreenRecorderProWin11)
+    background_log_app.gui_thread_ident = -1
+    background_log_app.settings = {
+        "problem_logs_enabled": True,
+        "problem_logs_retention_days": "120",
+        "problem_logs_error_retention_days": "240",
+        "problem_logs_max_file_mb": "15",
+        "problem_logs_keep_successful": False,
+    }
+    tracked_log_vars = []
+    for var_name in (
+        "problem_logs_enabled_var",
+        "problem_logs_retention_days_var",
+        "problem_logs_error_retention_days_var",
+        "problem_logs_max_file_mb_var",
+        "problem_logs_keep_successful_var",
+    ):
+        tracked = TrackedTkVar()
+        tracked_log_vars.append(tracked)
+        setattr(background_log_app, var_name, tracked)
+    background_values = (
+        background_log_app.should_write_problem_logs(),
+        background_log_app.get_problem_logs_retention_days(),
+        background_log_app.get_problem_logs_error_retention_days(),
+        background_log_app.get_problem_log_file_limit_bytes(),
+        background_log_app.keep_successful_problem_logs(),
+    )
+    if background_values != (True, 120, 240, 15 * 1024 * 1024, False):
+        print("ОШИБКА: фоновые логи не используют кэшированные обычные настройки.")
+        return 1
+    if any(var.get_calls for var in tracked_log_vars):
+        print("ОШИБКА: фоновая диагностика обращается к Tkinter-переменным и может заблокировать GUI.")
         return 1
     if 'source="windows_startup_recovery"' not in recovery_source:
         print("ОШИБКА: восстановление Print Screen после автозапуска отсутствует.")

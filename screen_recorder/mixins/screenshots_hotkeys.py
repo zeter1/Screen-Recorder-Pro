@@ -567,7 +567,7 @@ class ScreenshotsHotkeysMixin:
                 pass
         self._restore_ui_after_screenshot(success=success)
 
-    def enqueue_hotkey_action(self, action):
+    def enqueue_hotkey_action(self, action, callback_backend=None):
         """Поток keyboard только кладёт действие в очередь и не обращается к Tk."""
         if getattr(self, "_exiting", False):
             return
@@ -586,7 +586,7 @@ class ScreenshotsHotkeysMixin:
                     "action": action,
                     "registration_generation": getattr(self, "hotkey_registration_generation", None),
                     "backend": (
-                        getattr(self, "screenshot_hotkey_backend", None)
+                        callback_backend or getattr(self, "screenshot_hotkey_backend", None)
                         if action == "screenshot" else "keyboard"
                     ),
                     "native_thread_id": (
@@ -597,6 +597,37 @@ class ScreenshotsHotkeysMixin:
             self.hotkey_action_queue.put_nowait(action)
         except Exception:
             pass
+
+    def _enqueue_screenshot_hotkey_from_backend(self, backend):
+        """Объединяет WinAPI и резервный keyboard-hook без двойного снимка."""
+        now_perf = time.perf_counter()
+        duplicate = False
+        elapsed_ms = None
+        try:
+            lock = getattr(self, "screenshot_hotkey_callback_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self.screenshot_hotkey_callback_lock = lock
+            with lock:
+                previous = getattr(self, "screenshot_hotkey_last_accepted_callback_perf", None)
+                if previous is not None:
+                    elapsed_ms = max(0.0, (now_perf - float(previous)) * 1000.0)
+                    duplicate = elapsed_ms < 300.0
+                if not duplicate:
+                    self.screenshot_hotkey_last_accepted_callback_perf = now_perf
+        except Exception:
+            duplicate = False
+            self.screenshot_hotkey_last_accepted_callback_perf = now_perf
+        if duplicate:
+            self.diagnostic_log("hotkey_callback_duplicate_ignored", {
+                "action": "screenshot",
+                "backend": backend,
+                "elapsed_since_accepted_ms": round(elapsed_ms, 1) if elapsed_ms is not None else None,
+                "dedupe_window_ms": 300,
+            })
+            return False
+        self.enqueue_hotkey_action("screenshot", callback_backend=backend)
+        return True
 
     def process_hotkey_actions(self):
         """Выполняет глобальные горячие клавиши безопасно в GUI-потоке."""
@@ -810,7 +841,7 @@ class ScreenshotsHotkeysMixin:
                     error_code = int(ctypes.get_last_error())
                     raise OSError(error_code, ctypes.FormatError(error_code))
                 if int(message.message) == WM_HOTKEY and int(message.wParam) == hotkey_id:
-                    self.enqueue_hotkey_action("screenshot")
+                    self._enqueue_screenshot_hotkey_from_backend("windows_register_hotkey")
         except Exception as exc:
             result.setdefault("registered", False)
             result["error"] = repr(exc)
@@ -914,7 +945,11 @@ class ScreenshotsHotkeysMixin:
 
     def _remove_registered_hotkeys(self):
         """Снимает только постоянные горячие клавиши этой программы."""
-        for attr_name in ("hotkey_handle", "screenshot_hotkey_handle"):
+        for attr_name in (
+            "hotkey_handle",
+            "screenshot_hotkey_handle",
+            "screenshot_hotkey_backup_handle",
+        ):
             handle = getattr(self, attr_name, None)
             if handle is None:
                 continue
@@ -1277,10 +1312,36 @@ class ScreenshotsHotkeysMixin:
                     )
                 if native_success:
                     self.screenshot_hotkey_backend = "windows_register_hotkey"
+                    try:
+                        # Сторонняя программа записи экрана может поглотить
+                        # Print Screen своим low-level hook до доставки WM_HOTKEY.
+                        # Резервный несупрессивный hook получает ту же клавишу,
+                        # а дедупликация не даёт создать два снимка.
+                        self.screenshot_hotkey_backup_handle = keyboard.add_hotkey(
+                            screenshot_hotkey,
+                            lambda: self._enqueue_screenshot_hotkey_from_backend("keyboard_backup"),
+                            suppress=False,
+                        )
+                        self.diagnostic_log("screenshot_hotkey_backup_ready", {
+                            "source": source,
+                            "generation": generation,
+                            "hotkey": screenshot_hotkey,
+                            "primary_backend": "windows_register_hotkey",
+                            "backup_backend": "keyboard",
+                            "suppress": False,
+                        })
+                    except Exception as backup_exc:
+                        self.screenshot_hotkey_backup_handle = None
+                        self.diagnostic_log("screenshot_hotkey_backup_failed", {
+                            "source": source,
+                            "generation": generation,
+                            "hotkey": screenshot_hotkey,
+                            "error": repr(backup_exc),
+                        }, level="WARN")
                 else:
                     self.screenshot_hotkey_handle = keyboard.add_hotkey(
                         screenshot_hotkey,
-                        lambda: self.enqueue_hotkey_action("screenshot"),
+                        lambda: self._enqueue_screenshot_hotkey_from_backend("keyboard_fallback"),
                         suppress=suppress,
                     )
                     self.screenshot_hotkey_backend = (
@@ -1319,6 +1380,7 @@ class ScreenshotsHotkeysMixin:
             "screenshot_hotkey": screenshot_hotkey,
             "screenshot_registered": self._is_screenshot_hotkey_registered(),
             "screenshot_backend": getattr(self, "screenshot_hotkey_backend", None),
+            "screenshot_backup_registered": getattr(self, "screenshot_hotkey_backup_handle", None) is not None,
             "native_thread_id": getattr(self, "native_screenshot_hotkey_thread_id", None),
             "native_thread_alive": bool(
                 getattr(self, "native_screenshot_hotkey_thread", None)

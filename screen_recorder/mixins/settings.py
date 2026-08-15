@@ -128,6 +128,10 @@ class SettingsMixin:
                     data[key] = int(raw_settings.get(key))
         except Exception:
             pass
+        if isinstance(getattr(self, "settings", None), dict):
+            self.settings.update(data)
+        else:
+            self.settings = dict(data)
         try:
             SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
             serialized = json.dumps(data, ensure_ascii=False, indent=2)

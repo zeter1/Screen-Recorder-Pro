@@ -2,6 +2,36 @@ from ..shared import *
 
 
 class ProblemLogsMixin:
+    def _read_problem_log_setting(self, setting_key, var_name, default):
+        """Читает Tk-переменную только из GUI-потока, иначе обычный dict."""
+        gui_thread_ident = getattr(self, "gui_thread_ident", None)
+        is_gui_thread = gui_thread_ident is None or threading.get_ident() == gui_thread_ident
+        if is_gui_thread:
+            try:
+                var = getattr(self, var_name, None)
+                if var is not None:
+                    value = var.get()
+                    settings = getattr(self, "settings", None)
+                    if isinstance(settings, dict):
+                        settings[setting_key] = value
+                    return value
+            except Exception:
+                pass
+        try:
+            settings = getattr(self, "settings", None)
+            if isinstance(settings, dict) and setting_key in settings:
+                return settings.get(setting_key, default)
+        except Exception:
+            pass
+        try:
+            if SETTINGS_PATH.exists():
+                raw_settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                if setting_key in raw_settings:
+                    return raw_settings.get(setting_key, default)
+        except Exception:
+            pass
+        return default
+
     def should_write_problem_logs(self):
         """Главный переключатель логов проблем.
 
@@ -9,26 +39,11 @@ class ProblemLogsMixin:
         Это важно для самого раннего старта, когда setup_diagnostic_logging()
         вызывается раньше load_settings().
         """
-        try:
-            var = getattr(self, "problem_logs_enabled_var", None)
-            if var is not None:
-                return bool(var.get())
-        except Exception:
-            pass
-        try:
-            settings = getattr(self, "settings", None)
-            if isinstance(settings, dict) and "problem_logs_enabled" in settings:
-                return bool(settings.get("problem_logs_enabled", True))
-        except Exception:
-            pass
-        try:
-            if SETTINGS_PATH.exists():
-                raw_settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-                if "problem_logs_enabled" in raw_settings:
-                    return bool(raw_settings.get("problem_logs_enabled", True))
-        except Exception:
-            pass
-        return True
+        return bool(self._read_problem_log_setting(
+            "problem_logs_enabled",
+            "problem_logs_enabled_var",
+            True,
+        ))
 
     @staticmethod
     def _coerce_number(value, default, minimum, maximum, allow_float=False):
@@ -46,7 +61,11 @@ class ProblemLogsMixin:
 
     def get_problem_logs_retention_days(self):
         return self._coerce_number(
-            getattr(getattr(self, "problem_logs_retention_days_var", None), "get", lambda: "120")(),
+            self._read_problem_log_setting(
+                "problem_logs_retention_days",
+                "problem_logs_retention_days_var",
+                "120",
+            ),
             default=120,
             minimum=0,
             maximum=3650,
@@ -54,7 +73,11 @@ class ProblemLogsMixin:
 
     def get_problem_logs_error_retention_days(self):
         return self._coerce_number(
-            getattr(getattr(self, "problem_logs_error_retention_days_var", None), "get", lambda: "120")(),
+            self._read_problem_log_setting(
+                "problem_logs_error_retention_days",
+                "problem_logs_error_retention_days_var",
+                "120",
+            ),
             default=120,
             minimum=0,
             maximum=3650,
@@ -62,7 +85,11 @@ class ProblemLogsMixin:
 
     def get_problem_log_file_limit_bytes(self):
         mb = self._coerce_number(
-            getattr(getattr(self, "problem_logs_max_file_mb_var", None), "get", lambda: "2")(),
+            self._read_problem_log_setting(
+                "problem_logs_max_file_mb",
+                "problem_logs_max_file_mb_var",
+                "2",
+            ),
             default=2.0,
             minimum=0.2,
             maximum=20.0,
@@ -71,10 +98,11 @@ class ProblemLogsMixin:
         return int(float(mb) * 1024 * 1024)
 
     def keep_successful_problem_logs(self):
-        try:
-            return bool(self.problem_logs_keep_successful_var.get())
-        except Exception:
-            return True
+        return bool(self._read_problem_log_setting(
+            "problem_logs_keep_successful",
+            "problem_logs_keep_successful_var",
+            True,
+        ))
 
     def get_current_recording_log_path(self):
         """Путь для подробного лога текущей записи.
@@ -135,7 +163,11 @@ class ProblemLogsMixin:
         try:
             if not self.should_write_problem_logs():
                 return
-            if not bool(self.problem_logs_cleanup_on_start_var.get()):
+            if not bool(self._read_problem_log_setting(
+                "problem_logs_cleanup_on_start",
+                "problem_logs_cleanup_on_start_var",
+                True,
+            )):
                 return
             self.cleanup_problem_logs(reason="auto_start")
         except Exception as exc:
