@@ -1103,6 +1103,8 @@ class ScreenshotsHotkeysMixin:
         При автозапуске Explorer, Ножницы, оверлеи и драйверы клавиатуры ещё
         могут инициализироваться. Одна ранняя регистрация keyboard.add_hotkey()
         иногда остаётся формально успешной, но фактически не получает Print Screen.
+        Уже подтверждённый Windows RegisterHotKey не пересоздаём: остановка его
+        потока сообщений может ждать Windows и на это время блокировать Tkinter.
         """
         self._cancel_hotkey_recovery_jobs()
         if not getattr(self, "started_from_windows_startup", False) or not HOTKEY_AVAILABLE:
@@ -1117,6 +1119,19 @@ class ScreenshotsHotkeysMixin:
                     ]
                     if getattr(self, "_exiting", False) or not getattr(self, "running", True):
                         return
+                    if (
+                        getattr(self, "screenshot_hotkey_backend", None) == "windows_register_hotkey"
+                        and self._is_native_screenshot_hotkey_healthy()
+                    ):
+                        self.diagnostic_log("hotkey_startup_recovery_skipped_healthy", {
+                            "recovery_attempt": current_attempt,
+                            "scheduled_delay_ms": current_delay,
+                            "generation": getattr(self, "hotkey_registration_generation", 0),
+                            "screenshot_backend": "windows_register_hotkey",
+                            "native_thread_id": getattr(self, "native_screenshot_hotkey_thread_id", None),
+                            "reason": "healthy_native_registration_is_kept_to_avoid_gui_thread_wait",
+                        })
+                        return
                     self.register_hotkey(
                         source="windows_startup_recovery",
                         recovery_attempt=current_attempt,
@@ -1130,19 +1145,31 @@ class ScreenshotsHotkeysMixin:
             if getattr(self, "_exiting", False) or not getattr(self, "running", True):
                 return
             explorer_ready = None
-            if os.name == "nt" and PSUTIL_AVAILABLE:
+            if os.name == "nt":
                 try:
-                    explorer_ready = any(
-                        str(proc.info.get("name") or "").lower() == "explorer.exe"
-                        for proc in psutil.process_iter(["name"])
-                    )
+                    # Обход всех процессов через psutil здесь выполнялся в
+                    # Tkinter-потоке. На проблемном автозапуске лог обрывался
+                    # прямо перед этой проверкой, а панель и трей переставали
+                    # отвечать. GetShellWindow даёт нужный диагностический
+                    # ответ одним быстрым вызовом WinAPI без обхода процессов.
+                    user32 = ctypes.WinDLL("user32", use_last_error=True)
+                    user32.GetShellWindow.argtypes = []
+                    user32.GetShellWindow.restype = wintypes.HWND
+                    explorer_ready = bool(user32.GetShellWindow())
                 except Exception:
                     explorer_ready = None
             screenshot_registered = self._is_screenshot_hotkey_registered()
+            native_registration_reused = bool(
+                getattr(self, "screenshot_hotkey_backend", None) == "windows_register_hotkey"
+                and self._is_native_screenshot_hotkey_healthy()
+            )
             self.diagnostic_log("startup_hotkey_health_summary", {
                 "started_from_windows_startup": True,
                 "registration_generation": getattr(self, "hotkey_registration_generation", 0),
-                "expected_generation_after_recovery": 4,
+                "expected_generation_after_recovery": (
+                    getattr(self, "hotkey_registration_generation", 0)
+                    if native_registration_reused else 4
+                ),
                 "record_registered": getattr(self, "hotkey_handle", None) is not None,
                 "screenshot_registered": screenshot_registered,
                 "screenshot_backend": getattr(self, "screenshot_hotkey_backend", None),
@@ -1158,7 +1185,8 @@ class ScreenshotsHotkeysMixin:
                 "explorer_ready": explorer_ready,
                 "note_for_ai": (
                     "Для backend=windows_register_hotkey registered=true означает успешный ответ WinAPI "
-                    "и живой поток сообщений. Для keyboard окончательная проверка — hotkey_callback_received."
+                    "и живой поток сообщений; здоровая нативная регистрация при автозапуске не пересоздаётся. "
+                    "Для keyboard окончательная проверка — hotkey_callback_received."
                 ),
             }, level="INFO" if screenshot_registered else "WARN")
             if not screenshot_registered and self.screenshot_hotkey_var.get().strip():
@@ -1302,7 +1330,8 @@ class ScreenshotsHotkeysMixin:
             "failures": failures,
             "note_for_ai": (
                 "Print Screen в Windows использует RegisterHotKey с отдельным потоком сообщений. "
-                "При автозапуске backend полностью пересоздаётся через 3/10/30 секунд."
+                "При автозапуске здоровая нативная регистрация сохраняется; "
+                "fallback backend повторно проверяется через 3/10/30 секунд."
             ),
         }, level="INFO" if success else "WARN")
         return success

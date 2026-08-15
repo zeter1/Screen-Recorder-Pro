@@ -229,6 +229,57 @@ def main() -> int:
     if 'source="windows_startup_recovery"' not in recovery_source:
         print("ОШИБКА: восстановление Print Screen после автозапуска отсутствует.")
         return 1
+    if "hotkey_startup_recovery_skipped_healthy" not in recovery_source:
+        print("ОШИБКА: автозапуск снова пересоздаёт уже исправный нативный Print Screen backend.")
+        return 1
+    if "psutil.process_iter" in recovery_source or "GetShellWindow" not in recovery_source:
+        print("ОШИБКА: проверка Explorer при автозапуске снова может заблокировать GUI-поток.")
+        return 1
+
+    from screen_recorder.mixins import screenshots_hotkeys as hotkey_module
+
+    class FakeRoot:
+        def __init__(self):
+            self.callbacks = []
+
+        def after(self, delay_ms, callback):
+            job = f"job-{len(self.callbacks) + 1}"
+            self.callbacks.append((delay_ms, callback))
+            return job
+
+        def after_cancel(self, _job):
+            return None
+
+    class FakeVar:
+        def get(self):
+            return "print screen"
+
+    recovery_app = object.__new__(ScreenRecorderProWin11)
+    recovery_app.root = FakeRoot()
+    recovery_app.hotkey_recovery_jobs = []
+    recovery_app.started_from_windows_startup = True
+    recovery_app.running = True
+    recovery_app._exiting = False
+    recovery_app.screenshot_hotkey_backend = "windows_register_hotkey"
+    recovery_app.native_screenshot_hotkey_thread_id = 123
+    recovery_app.hotkey_registration_generation = 1
+    recovery_app.screenshot_hotkey_var = FakeVar()
+    recovery_events = []
+    registration_calls = []
+    recovery_app._is_native_screenshot_hotkey_healthy = lambda: True
+    recovery_app.diagnostic_log = lambda event, data=None, level="INFO": recovery_events.append(event)
+    recovery_app.register_hotkey = lambda *args, **kwargs: registration_calls.append((args, kwargs))
+    previous_hotkey_available = hotkey_module.HOTKEY_AVAILABLE
+    hotkey_module.HOTKEY_AVAILABLE = True
+    try:
+        recovery_app.schedule_startup_hotkey_recovery()
+        for _delay_ms, callback in recovery_app.root.callbacks[:3]:
+            callback()
+    finally:
+        hotkey_module.HOTKEY_AVAILABLE = previous_hotkey_available
+    if registration_calls or recovery_events.count("hotkey_startup_recovery_skipped_healthy") != 3:
+        print("ОШИБКА: здоровый нативный Print Screen backend повторно регистрируется при автозапуске.")
+        return 1
 
     selector_source = inspect.getsource(ScreenRecorderProWin11.select_capture_region)
     if "tk.Label(" in selector_source or "canvas.create_text(" not in selector_source:
