@@ -30,17 +30,18 @@ NVIDIA GTX 1660 SUPER / NVENC
 
 Программа имеет CPU/GDI fallback, но основной оптимизированный путь — `ddagrab + NVENC`.
 
-## Текущая стабильная версия
+## Текущая версия кода
 
 В `screen_recorder/shared.py`:
 
 ```python
-APP_BUILD = "2026-07-18-ddagrab-wallclock-poll-v8"
-DIAGNOSTIC_SCHEMA = "screen_recorder_smoothness_diagnostics_v8"
+APP_BUILD = "2026-08-16-audio-sync-diagnostics-v21"
+DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v17"
 DXCAM_CAPTURE_ENABLED = False
 ```
 
-Эта версия считается базой, потому что последняя тестовая запись была субъективно плавной, а логи показали:
+Видеоконвейер этой версии сохраняет проверенную базу `ddagrab + wall-clock CFR + NVENC`.
+Последняя запись перед улучшением A/V-якоря показала:
 
 - ровный выходной FPS;
 - отсутствие `Non-monotonic DTS`;

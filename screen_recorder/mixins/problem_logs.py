@@ -413,6 +413,7 @@ class ProblemLogsMixin:
             self.session_ai_prompt_path = None
             self.session_clock_alignment_path = None
             self.session_timing_detail_path = None
+            self.session_audio_sync_path = None
             self.current_log_path = None
             self.last_debug_log_path = None
             self.update_problem_logs_status_text()
@@ -511,6 +512,7 @@ class ProblemLogsMixin:
             self.session_ai_prompt_path = None
             self.session_clock_alignment_path = None
             self.session_timing_detail_path = None
+            self.session_audio_sync_path = None
             return None
         base_name = self.safe_log_folder_name(self.recording_session_id or datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
         root = LOGS_DIR
@@ -539,6 +541,7 @@ class ProblemLogsMixin:
         self.session_ai_prompt_path = folder / "12_готовый_промпт_для_ChatGPT_5.6_SOL.txt"
         self.session_clock_alignment_path = folder / "13_сводка_времени_и_дрейфа.json"
         self.session_timing_detail_path = folder / "14_детальный_тайминг_видео.json"
+        self.session_audio_sync_path = folder / "15_синхронизация_системного_звука.json"
         self._session_events_truncated = False
         self._session_ffmpeg_truncated = False
         self._session_errors_truncated = False
@@ -605,7 +608,10 @@ class ProblemLogsMixin:
                     "status": "recording_in_progress",
                     "ai_target": "ChatGPT 5.6 Thinking / SOL",
                     "app_build": APP_BUILD,
-                    "timing_strategy": "ddagrab fixed monotonic PTS by frame number",
+                    "timing_strategy": (
+                        "ddagrab arrival-wallclock rebase + one fps filter + "
+                        "container timescale 39600 + fps_mode passthrough"
+                    ),
                 }, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -626,6 +632,17 @@ class ProblemLogsMixin:
                 }, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            self.session_audio_sync_path.write_text(
+                json.dumps({
+                    "schema": "screen_recorder_coreaudio_sync_v1",
+                    "status": "not_used_yet",
+                    "purpose": (
+                        "Для каждого сегмента показывает монотонные якоря начала видео/CoreAudio, "
+                        "применённый trim/delay, итоговые границы дорожек и факт проверки recovery-пути."
+                    ),
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             # В обычной успешной сессии сохраняем только SHA-256/размеры исходников.
             # Полный ограниченный snapshot создаётся лениво только при реальной ошибке.
             write_modular_source_manifest(self.session_source_manifest_path)
@@ -640,7 +657,8 @@ class ProblemLogsMixin:
 2. Затем 04_ошибки_и_трейсы.txt и 01_события_записи.jsonl.
 3. Проверь 05_настройки_и_окружение.json и последовательность событий перед проблемой.
 4. Для проблем FFmpeg используй 02 и 03. Для рывков/плавности дополнительно используй 06–10, 13 и 14.
-5. Файл 11_версия_исходников.json — SHA-256 и размеры файлов конкретной версии.
+5. Для системного звука и A/V-синхронизации обязательно используй 15 и события python_loopback_* в 01.
+6. Файл 11_версия_исходников.json — SHA-256 и размеры файлов конкретной версии.
    11_исходный_код_только_при_ошибке.py появляется только если в сессии была реальная ошибка.
 
 Для каждой найденной проблемы дай:
@@ -676,6 +694,8 @@ class ProblemLogsMixin:
   нажатия — проблема до очереди GUI, в глобальном keyboard-hook/Windows. Если callback есть,
   точная причина выбора находится в status события capture_region_selection_finished.
 - Не называй предположение доказанным фактом.
+- Низкий visual update FPS без технической корреляции считай наблюдением, а не доказанным рывком записи.
+- recovery_path_exercised=false означает, что обычная запись прошла, но переключение аудиоустройства в этой сессии не проверялось.
 - Не предлагай большой рефакторинг, если проблему можно исправить локально.
 - Если нужного участка исходников нет в ограниченном файле 11, укажи точный файл/функцию, которую надо запросить из архива программы.
 """,
@@ -703,6 +723,7 @@ class ProblemLogsMixin:
             "ai_prompt_file": self.session_ai_prompt_path,
             "clock_alignment_file": self.session_clock_alignment_path,
             "timing_detail_file": self.session_timing_detail_path,
+            "audio_sync_file": self.session_audio_sync_path,
         })
         return folder
 
@@ -1063,6 +1084,20 @@ class ProblemLogsMixin:
             low_cadence_count = int(
                 ((frame_content.get("moving_content_cadence_analysis") or {}).get("low_cadence_window_count")) or 0
             )
+            strong_low_cadence_count = int(
+                ((frame_content.get("moving_content_cadence_analysis") or {}).get(
+                    "strong_continuous_low_cadence_window_count"
+                )) or 0
+            )
+            bursty_low_cadence_count = int(
+                ((frame_content.get("moving_content_cadence_analysis") or {}).get(
+                    "bursty_or_stepwise_low_cadence_window_count"
+                )) or 0
+            )
+            try:
+                audio_sync = self.summarize_python_loopback_audio_sync()
+            except Exception:
+                audio_sync = {"status": "unavailable"}
             snapshot_exists = bool(
                 getattr(self, "session_source_snapshot_path", None)
                 and Path(self.session_source_snapshot_path).exists()
@@ -1103,9 +1138,16 @@ class ProblemLogsMixin:
                     "gpu_max_percent": stat_max("nvidia_gpu_util_percent"),
                     "nvenc_max_percent": stat_max("nvidia_encoder_util_percent"),
                     "visual_freeze_candidate_count": candidate_count,
-                    "continuous_motion_low_cadence_window_count": low_cadence_count,
+                    "low_cadence_window_count": low_cadence_count,
+                    "strong_continuous_low_cadence_window_count": strong_low_cadence_count,
+                    "bursty_or_stepwise_low_cadence_window_count": bursty_low_cadence_count,
                     "post_visual_analysis_status": frame_content.get("status") or "pending",
+                    "system_audio_sync_status": audio_sync.get("status"),
+                    "system_audio_corrected_segment_count": audio_sync.get("corrected_segment_count"),
+                    "coreaudio_endpoint_invalidation_observed": audio_sync.get("endpoint_invalidation_observed"),
+                    "coreaudio_recovery_path_exercised": audio_sync.get("recovery_path_exercised"),
                 },
+                "system_audio_sync": audio_sync,
                 "important_recent_events": recent_events,
                 "source_version": {
                     "manifest": str(getattr(self, "session_source_manifest_path", None) or ""),
@@ -1117,13 +1159,14 @@ class ProblemLogsMixin:
             text = (
                 "AI-ДИАГНОСТИКА SCREEN RECORDER PRO — КОРОТКАЯ КАРТА СЕССИИ\n\n"
                 "Эта сводка специально маленькая. Не ищи здесь все подробности: она показывает, куда смотреть.\n"
-                "Порядок: 04 ошибки → 01 timeline → 05 окружение. Для видео: 06/13 → 07/08 → 09/10.\n"
+                "Порядок: 04 ошибки → 01 timeline → 05 окружение. Для видео: 06/13 → 07/08 → 09/10; для системного звука: 15.\n"
                 "11_версия_исходников.json содержит SHA-256 файлов; полный код в 11_*_только_при_ошибке.py появляется только при ERROR.\n\n"
                 + json.dumps(summary, ensure_ascii=False, indent=2)
                 + "\n\nПРАВИЛА ДЛЯ CHATGPT:\n"
                 "- Отделяй подтверждённый факт от гипотезы и указывай уверенность.\n"
                 "- Не считай статичный экран рывком без движения/технического совпадения.\n"
-                "- low cadence считается предупреждением только для окон с непрерывным движением >=50% переходов.\n"
+                "- low cadence без непрерывного движения и технической корреляции является наблюдением, а не доказанным рывком.\n"
+                "- В 15 проверяй применённый trim/delay и recovery_path_exercised.\n"
                 "- Если нужен код, сверяй APP_BUILD/SHA-256 с архивом программы; не предполагай, что manifest содержит сам код.\n"
                 "- Предлагай минимальную правку и конкретный способ проверки.\n"
             )

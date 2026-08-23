@@ -91,6 +91,7 @@ class ScreenRecorderProWin11(
         self.session_ai_prompt_path = None
         self.session_clock_alignment_path = None
         self.session_timing_detail_path = None
+        self.session_audio_sync_path = None
         self._session_events_truncated = False
         self._session_ffmpeg_truncated = False
         self._session_errors_truncated = False
@@ -414,6 +415,7 @@ class ScreenRecorderProWin11(
         self.make_gif_button = None
         self.trim_button = None
         self.python_loopback_audio_segments = {}
+        self.python_loopback_sync_metadata = {}
         self.current_python_loopback_recorder = None
         self.current_python_loopback_segment = None
         self.current_python_loopback_path = None

@@ -133,7 +133,7 @@ rg "self\.имя_поля" screen_recorder
 | `webcam_devices.py` | Поиск и выбор DirectShow-вебкамер. |
 | `audio_devices.py` | DShow/WASAPI-устройства, default endpoints, аудиометры. |
 | `processes.py` | Managed subprocess, watchdog, завершение дерева процессов. |
-| `problem_logs.py` | Логи запуска и сессии, файлы 00–13, traceback. |
+| `problem_logs.py` | Логи запуска и сессии, файлы 00–15, traceback. |
 | `ffmpeg_support.py` | Проверка FFmpeg, кодеров, фильтров, backend и temp root. |
 | `instant_buffer.py` | Фоновая подготовка, выбор области и отдельная Canvas-панель пометок скриншота. |
 | `recording_session.py` | `start_recording`, старт сегмента, запуск FFmpeg. |

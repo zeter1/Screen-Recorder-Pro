@@ -40,6 +40,8 @@ python -c "from screen_recorder.app import ScreenRecorderProWin11; from screen_r
 - [ ] Ошибка обязательного системного звука не маскируется успехом.
 - [ ] Микрофон mono → stereo.
 - [ ] A/V start/end проверяются после смешивания.
+- [ ] CoreAudio WAV выровнен по первому реальному видеокадру через trim/delay.
+- [ ] В файле 15 указано, был ли recovery-путь реально задействован.
 
 ## Потоки и процессы
 
@@ -53,7 +55,8 @@ python -c "from screen_recorder.app import ScreenRecorderProWin11; from screen_r
 
 - [ ] Ошибки содержат traceback.
 - [ ] Команда FFmpeg сохраняется.
-- [ ] Создаются ожидаемые файлы 00–13.
+- [ ] Создаются ожидаемые файлы 00–15.
+- [ ] Bursty/stepwise прокрутка без технической корреляции не объявляется подтверждённым рывком.
 - [ ] Логи ограничены по размеру.
 - [ ] `APP_BUILD` соответствует версии.
 - [ ] `DIAGNOSTIC_SCHEMA` обновлена при изменении структуры данных.

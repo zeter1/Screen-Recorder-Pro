@@ -1,6 +1,15 @@
 from ..shared import *
 
 
+class _CoreAudioHRESULTError(RuntimeError):
+    """Ошибка CoreAudio с сохранённым HRESULT для точного восстановления."""
+
+    def __init__(self, operation, hresult):
+        self.operation = str(operation)
+        self.hresult = int(hresult) & 0xFFFFFFFF
+        super().__init__(f"{self.operation} failed: 0x{self.hresult:08x}")
+
+
 class WasapiLoopbackWaveRecorder:
     """Запись системного звука Windows напрямую через CoreAudio/WASAPI loopback.
 
@@ -9,6 +18,10 @@ class WasapiLoopbackWaveRecorder:
     звук текущего устройства вывода Windows в WAV. После остановки WAV
     подмешивается в сегмент через FFmpeg.
     """
+
+    AUDCLNT_E_DEVICE_INVALIDATED = 0x88890004
+    RECONNECT_TIMEOUT_SECONDS = 10.0
+    RECONNECT_INTERVAL_SECONDS = 0.25
 
     def __init__(self, output_path, role="console", volume=1.0, log_callback=None):
         self.output_path = Path(output_path)
@@ -21,6 +34,10 @@ class WasapiLoopbackWaveRecorder:
         self.started = threading.Event()
         self.finished = threading.Event()
         self.capture_start_perf = None
+        self.audio_client_started_perf = None
+        self.endpoint_invalidations = 0
+        self.reconnect_attempts = 0
+        self.reconnect_successes = 0
 
     def log(self, text):
         try:
@@ -60,9 +77,85 @@ class WasapiLoopbackWaveRecorder:
                 self.thread.join(timeout=timeout)
         except Exception:
             pass
+        if self.thread and self.thread.is_alive():
+            raise RuntimeError(f"CoreAudio loopback не завершился за {float(timeout):.1f} с")
         if self.error:
             self.log(f"CoreAudio loopback stopped with error: {self.error}")
+            raise RuntimeError(str(self.error)) from self.error
         return self.output_path
+
+    @classmethod
+    def is_retryable_hresult(cls, value):
+        try:
+            return (int(value) & 0xFFFFFFFF) == cls.AUDCLNT_E_DEVICE_INVALIDATED
+        except Exception:
+            return False
+
+    @staticmethod
+    def _part_path(output_path, index):
+        output_path = Path(output_path)
+        if index <= 0:
+            return output_path
+        return output_path.with_name(f"{output_path.stem}.reconnect-{index:03d}{output_path.suffix}")
+
+    @staticmethod
+    def _wav_has_frames(path):
+        try:
+            return Path(path).exists() and Path(path).stat().st_size > 44
+        except Exception:
+            return False
+
+    def _merge_wav_parts(self, part_paths):
+        parts = [Path(path) for path in part_paths if self._wav_has_frames(path)]
+        if not parts:
+            raise RuntimeError("CoreAudio loopback не создал ни одного пригодного WAV-фрагмента.")
+        if len(parts) == 1:
+            if parts[0] != self.output_path:
+                os.replace(str(parts[0]), str(self.output_path))
+            return
+
+        merged_path = self.output_path.with_name(f"{self.output_path.stem}.reconnected.tmp{self.output_path.suffix}")
+        params = None
+        try:
+            with wave.open(str(merged_path), "wb") as output_wav:
+                for part_path in parts:
+                    with wave.open(str(part_path), "rb") as part_wav:
+                        current = (
+                            part_wav.getnchannels(),
+                            part_wav.getsampwidth(),
+                            part_wav.getframerate(),
+                            part_wav.getcomptype(),
+                        )
+                        if params is None:
+                            params = current
+                            output_wav.setnchannels(current[0])
+                            output_wav.setsampwidth(current[1])
+                            output_wav.setframerate(current[2])
+                            output_wav.setcomptype(current[3], part_wav.getcompname())
+                        elif current != params:
+                            raise RuntimeError(
+                                "После переключения устройства формат CoreAudio изменился: "
+                                f"ожидался {params}, получен {current}."
+                            )
+                        while True:
+                            chunk = part_wav.readframes(65536)
+                            if not chunk:
+                                break
+                            output_wav.writeframesraw(chunk)
+            os.replace(str(merged_path), str(self.output_path))
+        finally:
+            try:
+                if merged_path.exists():
+                    merged_path.unlink()
+            except Exception:
+                pass
+        for part_path in parts:
+            if part_path == self.output_path:
+                continue
+            try:
+                part_path.unlink()
+            except Exception:
+                pass
 
     def _make_guid_class(self):
         import uuid
@@ -92,6 +185,76 @@ class WasapiLoopbackWaveRecorder:
             pass
 
     def _run(self):
+        part_paths = []
+        part_index = 0
+        timeline_start_perf = float(self.capture_start_perf or time.perf_counter())
+        reconnect_window_started = None
+        fatal_error = None
+        try:
+            while not self.stop_event.is_set():
+                part_path = self._part_path(self.output_path, part_index)
+                try:
+                    self._run_capture_session(
+                        part_path,
+                        capture_start_perf=timeline_start_perf,
+                        session_index=part_index,
+                    )
+                    if self._wav_has_frames(part_path):
+                        part_paths.append(part_path)
+                    break
+                except _CoreAudioHRESULTError as exc:
+                    now = time.perf_counter()
+                    retryable = self.is_retryable_hresult(exc.hresult)
+                    if retryable:
+                        self.endpoint_invalidations += 1
+                    part_has_frames = self._wav_has_frames(part_path)
+                    if part_has_frames:
+                        part_paths.append(part_path)
+                        timeline_start_perf = now
+                        # Устройство уже успело работать. Следующая ошибка — новое
+                        # отдельное отключение со своим лимитом восстановления.
+                        reconnect_window_started = now
+                    elif reconnect_window_started is None:
+                        reconnect_window_started = now
+
+                    if not retryable or self.stop_event.is_set():
+                        raise
+
+                    elapsed = max(0.0, now - reconnect_window_started)
+                    if elapsed >= self.RECONNECT_TIMEOUT_SECONDS:
+                        raise RuntimeError(
+                            "Windows не вернул доступное устройство системного звука "
+                            f"за {self.RECONNECT_TIMEOUT_SECONDS:.1f} с после {exc}."
+                        ) from exc
+
+                    self.reconnect_attempts += 1
+                    self.log(
+                        "CoreAudio endpoint was invalidated; reconnecting to the current "
+                        f"Windows default output (attempt={self.reconnect_attempts}, error={exc})."
+                    )
+                    if self.stop_event.wait(self.RECONNECT_INTERVAL_SECONDS):
+                        fatal_error = RuntimeError(
+                            "CoreAudio endpoint был отключён непосредственно перед остановкой записи; "
+                            "системный звук может быть неполным."
+                        )
+                        break
+                    part_index += 1
+                    continue
+        except Exception as exc:
+            fatal_error = exc
+            self.log(f"CoreAudio loopback error: {exc}")
+        finally:
+            try:
+                if part_paths:
+                    self._merge_wav_parts(part_paths)
+            except Exception as merge_exc:
+                fatal_error = merge_exc
+                self.log(f"CoreAudio loopback WAV merge error: {merge_exc}")
+            self.error = fatal_error
+            self.started.set()
+            self.finished.set()
+
+    def _run_capture_session(self, output_path, capture_start_perf, session_index=0):
         ole32 = None
         initialized = False
         p_enumerator = ctypes.c_void_p()
@@ -148,8 +311,10 @@ class WasapiLoopbackWaveRecorder:
                 ctypes.byref(iid_immdevice_enumerator),
                 ctypes.byref(p_enumerator),
             )
-            if hr != 0 or not p_enumerator.value:
-                raise RuntimeError(f"CoCreateInstance IMMDeviceEnumerator failed: 0x{hr & 0xffffffff:08x}")
+            if hr != 0:
+                raise _CoreAudioHRESULTError("CoCreateInstance IMMDeviceEnumerator", hr)
+            if not p_enumerator.value:
+                raise RuntimeError("CoCreateInstance IMMDeviceEnumerator вернул пустой указатель.")
 
             enum_vtbl = ctypes.cast(p_enumerator, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
             get_default = ctypes.WINFUNCTYPE(
@@ -160,8 +325,10 @@ class WasapiLoopbackWaveRecorder:
                 ctypes.POINTER(ctypes.c_void_p),
             )(enum_vtbl[4])
             hr = get_default(p_enumerator, eRender, role_value, ctypes.byref(p_device))
-            if hr != 0 or not p_device.value:
-                raise RuntimeError(f"GetDefaultAudioEndpoint failed: 0x{hr & 0xffffffff:08x}")
+            if hr != 0:
+                raise _CoreAudioHRESULTError("GetDefaultAudioEndpoint", hr)
+            if not p_device.value:
+                raise RuntimeError("GetDefaultAudioEndpoint вернул пустой указатель.")
 
             dev_vtbl = ctypes.cast(p_device, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
             activate = ctypes.WINFUNCTYPE(
@@ -173,8 +340,10 @@ class WasapiLoopbackWaveRecorder:
                 ctypes.POINTER(ctypes.c_void_p),
             )(dev_vtbl[3])
             hr = activate(p_device, ctypes.byref(iid_iaudio_client), CLSCTX_ALL, None, ctypes.byref(p_audio_client))
-            if hr != 0 or not p_audio_client.value:
-                raise RuntimeError(f"IMMDevice.Activate(IAudioClient) failed: 0x{hr & 0xffffffff:08x}")
+            if hr != 0:
+                raise _CoreAudioHRESULTError("IMMDevice.Activate(IAudioClient)", hr)
+            if not p_audio_client.value:
+                raise RuntimeError("IMMDevice.Activate(IAudioClient) вернул пустой указатель.")
 
             ac_vtbl = ctypes.cast(p_audio_client, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
             get_mix_format = ctypes.WINFUNCTYPE(
@@ -183,8 +352,10 @@ class WasapiLoopbackWaveRecorder:
                 ctypes.POINTER(ctypes.c_void_p),
             )(ac_vtbl[8])
             hr = get_mix_format(p_audio_client, ctypes.byref(p_mix_format))
-            if hr != 0 or not p_mix_format.value:
-                raise RuntimeError(f"IAudioClient.GetMixFormat failed: 0x{hr & 0xffffffff:08x}")
+            if hr != 0:
+                raise _CoreAudioHRESULTError("IAudioClient.GetMixFormat", hr)
+            if not p_mix_format.value:
+                raise RuntimeError("IAudioClient.GetMixFormat вернул пустой указатель.")
 
             fmt = ctypes.cast(p_mix_format, ctypes.POINTER(WAVEFORMATEX)).contents
             channels = int(fmt.nChannels or 2)
@@ -216,7 +387,7 @@ class WasapiLoopbackWaveRecorder:
                 None,
             )
             if hr != 0:
-                raise RuntimeError(f"IAudioClient.Initialize(loopback) failed: 0x{hr & 0xffffffff:08x}")
+                raise _CoreAudioHRESULTError("IAudioClient.Initialize(loopback)", hr)
 
             get_service = ctypes.WINFUNCTYPE(
                 ctypes.c_long,
@@ -225,8 +396,10 @@ class WasapiLoopbackWaveRecorder:
                 ctypes.POINTER(ctypes.c_void_p),
             )(ac_vtbl[14])
             hr = get_service(p_audio_client, ctypes.byref(iid_iaudio_capture_client), ctypes.byref(p_capture_client))
-            if hr != 0 or not p_capture_client.value:
-                raise RuntimeError(f"IAudioClient.GetService(IAudioCaptureClient) failed: 0x{hr & 0xffffffff:08x}")
+            if hr != 0:
+                raise _CoreAudioHRESULTError("IAudioClient.GetService(IAudioCaptureClient)", hr)
+            if not p_capture_client.value:
+                raise RuntimeError("IAudioClient.GetService(IAudioCaptureClient) вернул пустой указатель.")
 
             cc_vtbl = ctypes.cast(p_capture_client, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
             get_buffer = ctypes.WINFUNCTYPE(
@@ -251,7 +424,7 @@ class WasapiLoopbackWaveRecorder:
             start = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(ac_vtbl[10])
             stop = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(ac_vtbl[11])
 
-            wav_file = wave.open(str(self.output_path), "wb")
+            wav_file = wave.open(str(output_path), "wb")
             wav_file.setnchannels(2)
             wav_file.setsampwidth(2)
             wav_file.setframerate(sample_rate)
@@ -262,14 +435,22 @@ class WasapiLoopbackWaveRecorder:
             )
             hr = start(p_audio_client)
             if hr != 0:
-                raise RuntimeError(f"IAudioClient.Start failed: 0x{hr & 0xffffffff:08x}")
+                raise _CoreAudioHRESULTError("IAudioClient.Start", hr)
+            if self.audio_client_started_perf is None:
+                self.audio_client_started_perf = time.perf_counter()
             self.started.set()
+            if session_index > 0:
+                self.reconnect_successes += 1
+                self.log(
+                    "CoreAudio loopback reconnected to the current Windows default output "
+                    f"(session={session_index}, rate={sample_rate})."
+                )
 
             # Учёт тишины: WASAPI shared loopback не отдаёт пакеты, когда ничего
             # не играет. Без добивки нулями длительность WAV = только звучащим
             # интервалам, и после каждой паузы звук уезжает вперёд видео.
             try:
-                silence_start_perf = float(self.capture_start_perf or time.perf_counter())
+                silence_start_perf = float(capture_start_perf or time.perf_counter())
             except Exception:
                 silence_start_perf = time.perf_counter()
             frames_written = 0
@@ -280,7 +461,7 @@ class WasapiLoopbackWaveRecorder:
                     packet_frames = ctypes.c_uint32(0)
                     hr = get_next_packet_size(p_capture_client, ctypes.byref(packet_frames))
                     if hr != 0:
-                        raise RuntimeError(f"GetNextPacketSize failed: 0x{hr & 0xffffffff:08x}")
+                        raise _CoreAudioHRESULTError("GetNextPacketSize", hr)
                     if packet_frames.value == 0:
                         expected = int((time.perf_counter() - silence_start_perf) * sample_rate)
                         if expected > frames_written:
@@ -304,7 +485,7 @@ class WasapiLoopbackWaveRecorder:
                             ctypes.byref(qpc_pos),
                         )
                         if hr != 0:
-                            raise RuntimeError(f"IAudioCaptureClient.GetBuffer failed: 0x{hr & 0xffffffff:08x}")
+                            raise _CoreAudioHRESULTError("IAudioCaptureClient.GetBuffer", hr)
                         try:
                             frames = int(num_frames.value)
                             if frames > 0:
@@ -317,21 +498,19 @@ class WasapiLoopbackWaveRecorder:
                                     wav_file.writeframesraw(pcm)
                                     frames_written += frames
                         finally:
-                            release_buffer(p_capture_client, num_frames)
+                            release_hr = release_buffer(p_capture_client, num_frames)
+                            if release_hr != 0:
+                                raise _CoreAudioHRESULTError("IAudioCaptureClient.ReleaseBuffer", release_hr)
 
                         packet_frames = ctypes.c_uint32(0)
                         hr = get_next_packet_size(p_capture_client, ctypes.byref(packet_frames))
                         if hr != 0:
-                            raise RuntimeError(f"GetNextPacketSize after release failed: 0x{hr & 0xffffffff:08x}")
+                            raise _CoreAudioHRESULTError("GetNextPacketSize after release", hr)
             finally:
                 try:
                     stop(p_audio_client)
                 except Exception:
                     pass
-        except Exception as exc:
-            self.error = exc
-            self.log(f"CoreAudio loopback error: {exc}")
-            self.started.set()
         finally:
             try:
                 if wav_file:
@@ -352,7 +531,6 @@ class WasapiLoopbackWaveRecorder:
                     ole32.CoUninitialize()
                 except Exception:
                     pass
-            self.finished.set()
 
     def _convert_to_pcm16_stereo(self, raw, frames, channels, bits, format_tag, subformat):
         if frames <= 0:

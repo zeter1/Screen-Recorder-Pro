@@ -316,9 +316,7 @@ class RecordingControlMixin:
                 pass
             try:
                 if save_success and self.recording_failure_reason:
-                    outcome = (
-                        "FFmpeg аварийно остановился; доступная корректная часть записи сохранена."
-                    )
+                    outcome = "Запись сохранена с предупреждением; доступная корректная часть сохранена."
                 elif save_success:
                     outcome = "Файл успешно сохранён."
                 else:
@@ -460,7 +458,7 @@ class RecordingControlMixin:
                         self.log_exception("finish_stop_recording.start_post_save_diagnostics", exc)
                 if failure_reason:
                     self.status_var.set(
-                        f"Запись аварийно остановлена. Доступная часть сохранена: {self.output_path}"
+                        f"Запись сохранена с предупреждением: {self.output_path}"
                     )
                 else:
                     self.status_var.set(f"Готово. Файл сохранён: {self.output_path}")
@@ -468,9 +466,10 @@ class RecordingControlMixin:
                 if not exit_after_finalize:
                     if failure_reason:
                         messagebox.showwarning(
-                            "Запись аварийно остановлена",
+                            "Запись сохранена с предупреждением",
                             f"{failure_reason}\n\n"
-                            "Программа сохранила доступную корректную часть записи:\n"
+                            "Программа сохранила доступную корректную часть записи. "
+                            "Проверь указанный в предупреждении источник:\n"
                             f"{self.last_output_path}{log_note}",
                         )
                         opened = False

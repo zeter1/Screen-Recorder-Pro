@@ -1045,6 +1045,38 @@ class SmoothnessDiagnosticsMixin:
             "last_sample": samples[-1],
         }
 
+    @staticmethod
+    def classify_visual_motion_window(update_indexes, transition_count, fps):
+        """Отделяет непрерывное движение от прокрутки/анимации отдельными порциями."""
+        try:
+            count = max(1, int(transition_count))
+            fps_value = max(1.0, float(fps))
+            indexes = sorted({int(value) for value in (update_indexes or []) if 0 <= int(value) < count})
+        except (TypeError, ValueError):
+            indexes = []
+            count = max(1, int(transition_count or 1))
+            fps_value = 60.0
+        motion_fraction = len(indexes) / count
+        update_gaps = [right - left for left, right in zip(indexes, indexes[1:])]
+        max_gap = max(update_gaps) if update_gaps else None
+        pause_threshold = max(4, int(round(fps_value * 0.08)))
+        if motion_fraction < 0.08:
+            classification = "mostly_static"
+        elif max_gap is not None and max_gap >= pause_threshold:
+            classification = "bursty_or_interrupted_motion"
+        elif motion_fraction >= 0.75:
+            classification = "continuous_motion"
+        else:
+            classification = "stepwise_motion_source_fps_unknown"
+        return {
+            "motion_pattern_classification": classification,
+            "motion_transition_fraction": round(motion_fraction, 6),
+            "max_gap_between_visual_updates_frames": max_gap,
+            "burst_pause_threshold_frames": pause_threshold,
+            "strong_continuous_motion_context": classification == "continuous_motion",
+            "requires_technical_correlation_for_recording_fault": classification != "continuous_motion",
+        }
+
     def analyze_visual_frame_cadence(
         self,
         path,
@@ -1414,6 +1446,11 @@ class SmoothnessDiagnosticsMixin:
                     right - left
                     for left, right in zip(update_indexes, update_indexes[1:])
                 ]
+                motion_pattern = self.classify_visual_motion_window(
+                    update_indexes,
+                    len(window_values),
+                    fps_for_time,
+                )
                 exact_ratio = (
                     sum(1 for value in window_values if value <= exact_threshold)
                     / len(window_values)
@@ -1423,7 +1460,7 @@ class SmoothnessDiagnosticsMixin:
                     / len(window_values)
                 )
                 duration_seconds = len(window_values) / fps_for_time
-                cadence_windows.append({
+                cadence_window = {
                     "start_frame_index": start_index,
                     "end_frame_index": start_index + len(window_values),
                     "start_seconds_estimated": round(start_index / fps_for_time, 6),
@@ -1442,7 +1479,9 @@ class SmoothnessDiagnosticsMixin:
                         round(statistics.median(update_gaps), 6) if update_gaps else None
                     ),
                     "max_gap_between_visual_updates_frames": max(update_gaps) if update_gaps else None,
-                })
+                }
+                cadence_window.update(motion_pattern)
+                cadence_windows.append(cadence_window)
 
             cadence_windows.sort(
                 key=lambda item: (
@@ -1456,6 +1495,14 @@ class SmoothnessDiagnosticsMixin:
                 item for item in cadence_windows
                 if float(item.get("motion_transition_fraction") or 0.0) >= 0.50
                 and float(item.get("visual_update_fps_estimated") or 0.0) < fps_for_time * 0.55
+            ]
+            strong_continuous_low_cadence_windows = [
+                item for item in low_cadence_windows
+                if item.get("strong_continuous_motion_context") is True
+            ]
+            bursty_or_stepwise_low_cadence_windows = [
+                item for item in low_cadence_windows
+                if item.get("strong_continuous_motion_context") is not True
             ]
 
             result.update({
@@ -1495,8 +1542,10 @@ class SmoothnessDiagnosticsMixin:
                 "suspected_freeze_candidates": automatic_candidates[:30],
                 "moving_content_cadence_analysis": {
                     "status": (
-                        "low_visual_update_cadence_detected"
-                        if low_cadence_windows else
+                        "continuous_low_cadence_candidates_detected"
+                        if strong_continuous_low_cadence_windows else
+                        "bursty_or_stepwise_low_cadence_observed"
+                        if bursty_or_stepwise_low_cadence_windows else
                         "no_low_cadence_moving_windows_detected"
                     ),
                     "analysis_window_seconds": round(cadence_window_frames / fps_for_time, 6),
@@ -1504,20 +1553,35 @@ class SmoothnessDiagnosticsMixin:
                     "motion_threshold_mean_abs_diff_luma": round(cadence_motion_threshold, 6),
                     "moving_window_count": moving_windows,
                     "low_cadence_window_count": len(low_cadence_windows),
+                    "strong_continuous_low_cadence_window_count": len(strong_continuous_low_cadence_windows),
+                    "bursty_or_stepwise_low_cadence_window_count": len(bursty_or_stepwise_low_cadence_windows),
+                    "diagnostic_severity": (
+                        "candidate_requires_technical_correlation"
+                        if strong_continuous_low_cadence_windows else
+                        "observation_source_motion_is_bursty_or_stepwise"
+                    ),
                     "rule": (
-                        "окно содержит заметное движение минимум в 50% переходов, "
-                        "но оценочная частота визуальных обновлений ниже 55% целевого FPS"
+                        "низкий visual update FPS сначала классифицируется как continuous, stepwise или bursty; "
+                        "ошибка записи не подтверждается без непрерывного движения и технической корреляции"
                     ),
                     "highest_motion_windows": cadence_windows[:20],
                     "lowest_cadence_moving_windows": sorted(
                         low_cadence_windows,
                         key=lambda item: float(item.get("visual_update_fps_estimated") or 0.0),
                     )[:20],
+                    "strong_continuous_low_cadence_windows": sorted(
+                        strong_continuous_low_cadence_windows,
+                        key=lambda item: float(item.get("visual_update_fps_estimated") or 0.0),
+                    )[:20],
+                    "bursty_or_stepwise_low_cadence_windows": sorted(
+                        bursty_or_stepwise_low_cadence_windows,
+                        key=lambda item: float(item.get("visual_update_fps_estimated") or 0.0),
+                    )[:20],
                     "important_limitation": (
                         "Низкая частота визуальных обновлений может принадлежать исходному видео, "
-                        "анимации или приложению. Окна с кратким движением и в основном статичной сценой "
-                        "не повышают общий статус. Для непрерывного скролла/перетаскивания это сильный "
-                        "признак повторов содержимого, даже когда PTS контейнера идеальны."
+                        "анимации, браузерной прокрутке порциями или приложению. Bursty/stepwise окна "
+                        "не понижают общий статус без совпадения с drop/stall/drift/перегрузкой. Даже continuous "
+                        "окно остаётся кандидатом, пока нет технической корреляции или ручного просмотра."
                     ),
                 },
                 "frame_difference_statistics": {
@@ -1580,9 +1644,119 @@ class SmoothnessDiagnosticsMixin:
             except Exception:
                 pass
 
+    @staticmethod
+    def _visual_diagnostic_targets(frame_content_analysis, max_items=30):
+        frame_content_analysis = frame_content_analysis or {}
+        targets = []
+        for candidate in list(frame_content_analysis.get("suspected_freeze_candidates") or []):
+            item = dict(candidate)
+            item["candidate_kind"] = "motion_qualified_freeze"
+            targets.append(item)
+        cadence = frame_content_analysis.get("moving_content_cadence_analysis") or {}
+        for candidate in list(cadence.get("lowest_cadence_moving_windows") or []):
+            item = dict(candidate)
+            if item.get("center_seconds_estimated") is None:
+                try:
+                    item["center_seconds_estimated"] = round(
+                        (float(item.get("start_seconds_estimated")) + float(item.get("end_seconds_estimated"))) / 2.0,
+                        6,
+                    )
+                except Exception:
+                    continue
+            item["candidate_kind"] = (
+                "continuous_low_cadence"
+                if item.get("strong_continuous_motion_context") is True else
+                "bursty_or_stepwise_low_cadence"
+            )
+            targets.append(item)
+        return targets[: max(1, int(max_items))]
+
+    @staticmethod
+    def _candidate_technical_correlation_signals(progress_near, performance_near, target_fps=None):
+        signals = set()
+        try:
+            target_fps = float(target_fps) if target_fps is not None else None
+        except Exception:
+            target_fps = None
+        for sample in progress_near or []:
+            try:
+                steady_sample = float(sample.get("elapsed_from_ffmpeg_launch_seconds")) >= 3.0
+            except Exception:
+                steady_sample = False
+            try:
+                if int(sample.get("drop_frames") or 0) > 0:
+                    signals.add("ffmpeg_drop_counter_nonzero")
+            except Exception:
+                pass
+            try:
+                if steady_sample and float(sample.get("speed")) < 0.90:
+                    signals.add("ffmpeg_speed_below_0_90")
+            except Exception:
+                pass
+            try:
+                if steady_sample and target_fps and float(sample.get("fps")) < target_fps * 0.80:
+                    signals.add("ffmpeg_fps_below_80_percent")
+            except Exception:
+                pass
+        swap_in = []
+        swap_out = []
+        for sample in performance_near or []:
+            try:
+                if float(sample.get("system_cpu_percent")) >= 95.0:
+                    signals.add("system_cpu_overload")
+            except Exception:
+                pass
+            try:
+                ffmpeg_cpu = sample.get("ffmpeg_cpu_percent")
+                if ffmpeg_cpu is None:
+                    ffmpeg_cpu = (sample.get("ffmpeg_process") or {}).get("cpu_percent")
+                if float(ffmpeg_cpu) >= 95.0:
+                    signals.add("ffmpeg_cpu_overload")
+            except Exception:
+                pass
+            try:
+                gpu_util = sample.get("gpu_util_percent")
+                if gpu_util is None:
+                    gpu_util = max(
+                        [float(gpu.get("gpu_util_percent") or 0.0) for gpu in ((sample.get("nvidia_gpu") or {}).get("gpus") or [])]
+                        or [0.0]
+                    )
+                if float(gpu_util) >= 95.0:
+                    signals.add("gpu_overload")
+            except Exception:
+                pass
+            try:
+                encoder_util = sample.get("encoder_util_percent")
+                if encoder_util is None:
+                    encoder_util = max(
+                        [float(gpu.get("encoder_util_percent") or 0.0) for gpu in ((sample.get("nvidia_gpu") or {}).get("gpus") or [])]
+                        or [0.0]
+                    )
+                if float(encoder_util) >= 95.0:
+                    signals.add("nvenc_overload")
+            except Exception:
+                pass
+            try:
+                swap_data = sample.get("swap") or {}
+                swap_in_value = sample.get("swap_in_bytes_total")
+                swap_out_value = sample.get("swap_out_bytes_total")
+                if swap_in_value is None:
+                    swap_in_value = swap_data.get("sin_bytes_total")
+                if swap_out_value is None:
+                    swap_out_value = swap_data.get("sout_bytes_total")
+                swap_in.append(int(swap_in_value))
+                swap_out.append(int(swap_out_value))
+            except Exception:
+                pass
+        if len(swap_in) >= 2 and max(swap_in) > min(swap_in):
+            signals.add("swap_in_activity")
+        if len(swap_out) >= 2 and max(swap_out) > min(swap_out):
+            signals.add("swap_out_activity")
+        return sorted(signals)
+
     def _automatic_evidence_around_candidates(self, frame_content_analysis):
         """Сопоставляет автоматические кандидаты с FFmpeg и нагрузкой системы."""
-        candidates = list((frame_content_analysis or {}).get("suspected_freeze_candidates") or [])[:30]
+        candidates = self._visual_diagnostic_targets(frame_content_analysis, max_items=30)
         with self.recording_progress_lock:
             progress = list(self.recording_progress_samples)
         with self.recording_performance_lock:
@@ -1600,7 +1774,13 @@ class SmoothnessDiagnosticsMixin:
                     video_time = float(sample.get("out_time_seconds"))
                     delta = video_time - target
                     if abs(delta) <= 1.0:
-                        item = dict(sample)
+                        item = {
+                            key: sample.get(key)
+                            for key in (
+                                "wall_time", "out_time_seconds", "frame", "fps", "speed",
+                                "dup_frames", "drop_frames", "progress", "elapsed_from_ffmpeg_launch_seconds"
+                            )
+                        }
                         item["seconds_from_candidate"] = round(delta, 6)
                         progress_near.append(item)
                 except Exception:
@@ -1611,8 +1791,27 @@ class SmoothnessDiagnosticsMixin:
                     video_time = float(latest.get("out_time_seconds"))
                     delta = video_time - target
                     if abs(delta) <= 1.0:
-                        item = dict(sample)
-                        item["seconds_from_candidate"] = round(delta, 6)
+                        gpu_samples = ((sample.get("nvidia_gpu") or {}).get("gpus") or [])
+                        item = {
+                            "wall_time": sample.get("wall_time"),
+                            "seconds_from_candidate": round(delta, 6),
+                            "system_cpu_percent": sample.get("system_cpu_percent"),
+                            "memory_percent": (sample.get("memory") or {}).get("percent"),
+                            "swap_percent": (sample.get("swap") or {}).get("percent"),
+                            "swap_in_bytes_total": (sample.get("swap") or {}).get("sin_bytes_total"),
+                            "swap_out_bytes_total": (sample.get("swap") or {}).get("sout_bytes_total"),
+                            "ffmpeg_cpu_percent": (sample.get("ffmpeg_process") or {}).get("cpu_percent"),
+                            "gpu_util_percent": max(
+                                [float(gpu.get("gpu_util_percent") or 0.0) for gpu in gpu_samples] or [0.0]
+                            ),
+                            "encoder_util_percent": max(
+                                [float(gpu.get("encoder_util_percent") or 0.0) for gpu in gpu_samples] or [0.0]
+                            ),
+                            "latest_ffmpeg_progress": {
+                                key: latest.get(key)
+                                for key in ("out_time_seconds", "fps", "speed", "dup_frames", "drop_frames")
+                            },
+                        }
                         performance_near.append(item)
                 except Exception:
                     pass
@@ -1620,6 +1819,11 @@ class SmoothnessDiagnosticsMixin:
                 "candidate": candidate,
                 "ffmpeg_progress_within_1_second": progress_near,
                 "system_performance_within_1_second": performance_near,
+                "technical_correlation_signals": self._candidate_technical_correlation_signals(
+                    progress_near,
+                    performance_near,
+                    (frame_content_analysis or {}).get("fps_used_for_estimated_timestamps"),
+                ),
             })
         return evidence
 
@@ -1638,6 +1842,7 @@ class SmoothnessDiagnosticsMixin:
         progress_summary,
         performance_summary,
         clock_alignment=None,
+        candidate_evidence=None,
     ):
         """Короткий машинный вывод с разделением фактов и наблюдений."""
         positives = []
@@ -1727,15 +1932,72 @@ class SmoothnessDiagnosticsMixin:
                     message + ". Небольшое отличие ещё может быть погрешностью старта/остановки сегмента."
                 )
 
+        memory_max = self._summary_stat_max(performance_summary, "memory_percent")
+        swap_max = self._summary_stat_max(performance_summary, "swap_percent")
+        swap_in_delta = int((performance_summary or {}).get("swap_in_bytes_during_recording") or 0)
+        swap_out_delta = int((performance_summary or {}).get("swap_out_bytes_during_recording") or 0)
+        cpu_max = self._summary_stat_max(performance_summary, "system_cpu_percent")
+        gpu_max = self._summary_stat_max(performance_summary, "nvidia_gpu_util_percent")
+        encoder_max = self._summary_stat_max(performance_summary, "nvidia_encoder_util_percent")
+
         cadence_analysis = (
             (frame_content_analysis or {}).get("moving_content_cadence_analysis") or {}
         )
         low_cadence_count = int(cadence_analysis.get("low_cadence_window_count") or 0)
-        if low_cadence_count > 0:
+        strong_low_cadence_count = int(
+            cadence_analysis.get("strong_continuous_low_cadence_window_count") or 0
+        )
+        bursty_low_cadence_count = int(
+            cadence_analysis.get("bursty_or_stepwise_low_cadence_window_count") or 0
+        )
+        cadence_technical_correlations = []
+        for evidence_item in candidate_evidence or []:
+            candidate = evidence_item.get("candidate") or {}
+            if candidate.get("candidate_kind") == "continuous_low_cadence":
+                cadence_technical_correlations.extend(
+                    list(evidence_item.get("technical_correlation_signals") or [])
+                )
+        cadence_technical_correlations = sorted(set(cadence_technical_correlations))
+        # Для старых отчётов без временной корреляции оставляем только глобальные
+        # признаки. В новом формате приоритет имеют сигналы рядом с конкретным окном.
+        use_global_correlation_fallback = candidate_evidence is None
+        if use_global_correlation_fallback and drop_count > 0:
+            cadence_technical_correlations.append("ffmpeg_drop")
+        if use_global_correlation_fallback and stall_count > 0:
+            cadence_technical_correlations.append("progress_stall")
+        if use_global_correlation_fallback and health_status in {"warning", "error"}:
+            cadence_technical_correlations.append("container_timing")
+        if use_global_correlation_fallback and alignment_status in {"persistent_timeline_lag_detected", "persistent_timeline_lead_detected"}:
+            cadence_technical_correlations.append("clock_drift")
+        if use_global_correlation_fallback and (swap_in_delta > 0 or swap_out_delta > 0):
+            cadence_technical_correlations.append("active_swap_io")
+        if use_global_correlation_fallback and cpu_max is not None and cpu_max >= 95:
+            cadence_technical_correlations.append("cpu_overload")
+        if use_global_correlation_fallback and gpu_max is not None and gpu_max >= 95:
+            cadence_technical_correlations.append("gpu_overload")
+        if use_global_correlation_fallback and encoder_max is not None and encoder_max >= 95:
+            cadence_technical_correlations.append("nvenc_overload")
+        if strong_low_cadence_count > 0 and cadence_technical_correlations:
             warnings.append(
-                f"Анализ содержимого нашёл {low_cadence_count} движущихся окон с низкой "
-                "частотой визуальных обновлений. Это возможные повторы изображения, "
-                "которые обычные PTS/dup/drop не показывают."
+                f"Найдено {strong_low_cadence_count} непрерывно движущихся окон с низкой частотой "
+                "визуальных обновлений и техническим совпадением: "
+                + ", ".join(cadence_technical_correlations)
+                + ". Это обоснованный кандидат на проблему записи, но всё ещё требует просмотра файла."
+            )
+        elif strong_low_cadence_count > 0:
+            observations.append(
+                f"Найдено {strong_low_cadence_count} непрерывно движущихся окон с низким visual update FPS, "
+                "но drop/stall/timing/drift их не подтверждают. Возможен FPS исходного приложения."
+            )
+        if bursty_low_cadence_count > 0:
+            observations.append(
+                f"Ещё {bursty_low_cadence_count} low-cadence окон классифицированы как прокрутка/движение "
+                "порциями или неизвестный FPS приложения; они не понижают здоровье записи."
+            )
+        elif low_cadence_count > 0 and strong_low_cadence_count == 0:
+            observations.append(
+                f"Найдено {low_cadence_count} low-cadence окон старого/неполного формата; "
+                "без классификации движения они не считаются подтверждённым рывком."
             )
 
         exact_duplicate_percent = (frame_content_analysis or {}).get(
@@ -1761,18 +2023,20 @@ class SmoothnessDiagnosticsMixin:
         else:
             positives.append("Анализ содержимого не нашёл статичных интервалов, окружённых движением.")
 
-        memory_max = self._summary_stat_max(performance_summary, "memory_percent")
-        swap_max = self._summary_stat_max(performance_summary, "swap_percent")
-        swap_in_delta = int((performance_summary or {}).get("swap_in_bytes_during_recording") or 0)
-        swap_out_delta = int((performance_summary or {}).get("swap_out_bytes_during_recording") or 0)
-        cpu_max = self._summary_stat_max(performance_summary, "system_cpu_percent")
-        gpu_max = self._summary_stat_max(performance_summary, "nvidia_gpu_util_percent")
-        encoder_max = self._summary_stat_max(performance_summary, "nvidia_encoder_util_percent")
         if memory_max is not None:
-            if memory_max >= 95:
-                problems.append(f"Оперативная память была занята до {memory_max:.1f}% — возможен активный своп.")
+            if memory_max >= 95 and (swap_in_delta > 0 or swap_out_delta > 0):
+                warnings.append(
+                    f"Оперативная память была занята до {memory_max:.1f}% и одновременно работал файл подкачки."
+                )
+            elif memory_max >= 95:
+                observations.append(
+                    f"Оперативная память была занята до {memory_max:.1f}%, но активный swap I/O не обнаружен."
+                )
             elif memory_max >= 85:
-                warnings.append(f"Оперативная память была занята до {memory_max:.1f}%; желательно освободить RAM.")
+                observations.append(
+                    f"Оперативная память была занята до {memory_max:.1f}%; без swap I/O это запас ресурсов, "
+                    "а не подтверждённая причина рывков."
+                )
             elif memory_max >= 80:
                 observations.append(f"Оперативная память была занята до {memory_max:.1f}%, но критического дефицита не видно.")
         if swap_in_delta > 0 or swap_out_delta > 0:
@@ -1892,7 +2156,7 @@ class SmoothnessDiagnosticsMixin:
 
     def _automatic_evidence_from_log_files(self, frame_content_analysis, progress_path, performance_path):
         """Ищет контекст кандидатов по сохранённым адаптивным JSONL, не по mutable self-state."""
-        candidates = list((frame_content_analysis or {}).get("suspected_freeze_candidates") or [])[:20]
+        candidates = self._visual_diagnostic_targets(frame_content_analysis, max_items=20)
         progress = self._read_jsonl_samples(progress_path)
         performance = self._read_jsonl_samples(performance_path)
         evidence = []
@@ -1910,7 +2174,10 @@ class SmoothnessDiagnosticsMixin:
                     if abs(delta) <= 1.5:
                         item = {
                             key: sample.get(key)
-                            for key in ("wall_time", "out_time_seconds", "frame", "fps", "speed", "dup_frames", "drop_frames")
+                            for key in (
+                                "wall_time", "out_time_seconds", "frame", "fps", "speed", "dup_frames",
+                                "drop_frames", "elapsed_from_ffmpeg_launch_seconds"
+                            )
                         }
                         item["seconds_from_candidate"] = round(delta, 6)
                         progress_near.append(item)
@@ -1929,6 +2196,16 @@ class SmoothnessDiagnosticsMixin:
                             "memory_percent": (sample.get("memory") or {}).get("percent"),
                             "swap_percent": (sample.get("swap") or {}).get("percent"),
                             "ffmpeg_cpu_percent": (sample.get("ffmpeg_process") or {}).get("cpu_percent"),
+                            "swap_in_bytes_total": (sample.get("swap") or {}).get("sin_bytes_total"),
+                            "swap_out_bytes_total": (sample.get("swap") or {}).get("sout_bytes_total"),
+                            "gpu_util_percent": max(
+                                [float(gpu.get("gpu_util_percent") or 0.0) for gpu in ((sample.get("nvidia_gpu") or {}).get("gpus") or [])]
+                                or [0.0]
+                            ),
+                            "encoder_util_percent": max(
+                                [float(gpu.get("encoder_util_percent") or 0.0) for gpu in ((sample.get("nvidia_gpu") or {}).get("gpus") or [])]
+                                or [0.0]
+                            ),
                             "latest_ffmpeg_progress": {
                                 key: latest.get(key)
                                 for key in ("out_time_seconds", "fps", "speed", "dup_frames", "drop_frames")
@@ -1941,6 +2218,11 @@ class SmoothnessDiagnosticsMixin:
                 "candidate": candidate,
                 "ffmpeg_progress_near": progress_near[:8],
                 "system_performance_near": performance_near[:6],
+                "technical_correlation_signals": self._candidate_technical_correlation_signals(
+                    progress_near,
+                    performance_near,
+                    (frame_content_analysis or {}).get("fps_used_for_estimated_timestamps"),
+                ),
             })
         return evidence
 
@@ -1959,12 +2241,14 @@ class SmoothnessDiagnosticsMixin:
             "auto_stutter_path": str(self.session_auto_stutter_path) if self.session_auto_stutter_path else None,
             "clock_alignment_path": str(self.session_clock_alignment_path) if self.session_clock_alignment_path else None,
             "timing_detail_path": str(getattr(self, "session_timing_detail_path", None) or ""),
+            "audio_sync_path": str(getattr(self, "session_audio_sync_path", None) or ""),
             "source_manifest_path": str(getattr(self, "session_source_manifest_path", None) or ""),
             "source_snapshot_path": str(self.session_source_snapshot_path) if self.session_source_snapshot_path else None,
             "timing_summary": timing_summary or {},
             "progress_summary": self.summarize_ffmpeg_progress(),
             "performance_summary": self.summarize_performance_samples(),
             "clock_alignment": clock_alignment,
+            "audio_sync": self.write_python_loopback_audio_sync_report(),
             "outcome": outcome,
             "error_text": error_text,
             "capture_backend": self.recording_capture_backend,
@@ -2015,6 +2299,7 @@ class SmoothnessDiagnosticsMixin:
                 },
                 "ffmpeg_progress": self._compact_progress_summary(context.get("progress_summary")),
                 "performance": self._compact_performance_summary(context.get("performance_summary")),
+                "system_audio_sync": context.get("audio_sync") or {"status": "not_used"},
                 "post_visual_analysis": {
                     "status": "pending_background",
                     "note": "Видео уже сохранено и проверено; визуальный анализ выполняется отдельно и не задерживает UI.",
@@ -2023,6 +2308,7 @@ class SmoothnessDiagnosticsMixin:
                     "progress": context.get("progress_path"),
                     "performance": context.get("performance_path"),
                     "frame_content": context.get("frame_content_path"),
+                    "audio_sync": context.get("audio_sync_path"),
                     "candidates": context.get("auto_stutter_path"),
                     "clock_alignment": context.get("clock_alignment_path"),
                     "timing_detail": context.get("timing_detail_path"),
@@ -2056,17 +2342,18 @@ class SmoothnessDiagnosticsMixin:
         performance_summary = context.get("performance_summary") or {}
         timing_summary = context.get("timing_summary") or {}
         clock_alignment = context.get("clock_alignment") or {}
+        evidence = self._automatic_evidence_from_log_files(
+            frame_content_analysis,
+            context.get("progress_path"),
+            context.get("performance_path"),
+        )
         automatic_verdict = self.build_automatic_smoothness_verdict(
             timing_summary,
             frame_content_analysis,
             progress_summary,
             performance_summary,
             clock_alignment=clock_alignment,
-        )
-        evidence = self._automatic_evidence_from_log_files(
-            frame_content_analysis,
-            context.get("progress_path"),
-            context.get("performance_path"),
+            candidate_evidence=evidence,
         )
 
         cadence = (frame_content_analysis or {}).get("moving_content_cadence_analysis") or {}
@@ -2081,6 +2368,9 @@ class SmoothnessDiagnosticsMixin:
                 "status": cadence.get("status"),
                 "moving_window_count": cadence.get("moving_window_count"),
                 "low_cadence_window_count": cadence.get("low_cadence_window_count"),
+                "strong_continuous_low_cadence_window_count": cadence.get("strong_continuous_low_cadence_window_count"),
+                "bursty_or_stepwise_low_cadence_window_count": cadence.get("bursty_or_stepwise_low_cadence_window_count"),
+                "diagnostic_severity": cadence.get("diagnostic_severity"),
                 "rule": cadence.get("rule"),
                 "lowest_cadence_moving_windows": list(cadence.get("lowest_cadence_moving_windows") or [])[:10],
             },
@@ -2108,6 +2398,7 @@ class SmoothnessDiagnosticsMixin:
             },
             "ffmpeg_progress": self._compact_progress_summary(progress_summary),
             "performance": self._compact_performance_summary(performance_summary),
+            "system_audio_sync": context.get("audio_sync") or {"status": "not_used"},
             "visual_frame_content": frame_brief,
             "candidate_evidence_nearby": evidence[:12],
             "raw_log_files": {
@@ -2117,11 +2408,12 @@ class SmoothnessDiagnosticsMixin:
                 "candidates": context.get("auto_stutter_path"),
                 "clock_alignment": context.get("clock_alignment_path"),
                 "timing_detail": context.get("timing_detail_path"),
+                "audio_sync": context.get("audio_sync_path"),
                 "source_manifest": context.get("source_manifest_path"),
             },
             "ai_rules": [
                 "Не считать статичную сцену техническим рывком без движения и корреляции.",
-                "low_visual_update_cadence понижает статус только при движении минимум в 50% переходов окна.",
+                "Low cadence понижает статус только при непрерывном движении и технической корреляции.",
                 "Сопоставлять кандидаты с 07/08 и техническими счетчиками до вывода о причине.",
             ],
         }
@@ -2166,7 +2458,10 @@ class SmoothnessDiagnosticsMixin:
                     "progress_stalls": progress_summary.get("possible_progress_stalls_count"),
                     "steady_speed_median": progress_summary.get("steady_speed_median_after_3s"),
                     "visual_candidate_count": frame_brief.get("candidate_count"),
-                    "continuous_motion_low_cadence_window_count": frame_brief["moving_content_cadence"].get("low_cadence_window_count"),
+                    "low_cadence_window_count": frame_brief["moving_content_cadence"].get("low_cadence_window_count"),
+                    "strong_continuous_low_cadence_window_count": frame_brief["moving_content_cadence"].get("strong_continuous_low_cadence_window_count"),
+                    "bursty_or_stepwise_low_cadence_window_count": frame_brief["moving_content_cadence"].get("bursty_or_stepwise_low_cadence_window_count"),
+                    "system_audio_sync_status": (context.get("audio_sync") or {}).get("status"),
                     "source_manifest": context.get("source_manifest_path"),
                 }
                 text = (
@@ -2272,6 +2567,7 @@ class SmoothnessDiagnosticsMixin:
                 progress_summary,
                 performance_summary,
                 clock_alignment=clock_alignment,
+                candidate_evidence=automatic_evidence,
             )
             report = {
                 "schema": DIAGNOSTIC_SCHEMA,
@@ -2320,6 +2616,7 @@ class SmoothnessDiagnosticsMixin:
                 "visual_frame_content_analysis": frame_content_analysis,
                 "ffmpeg_progress_summary": progress_summary,
                 "system_performance_summary": performance_summary,
+                "system_audio_sync": self.summarize_python_loopback_audio_sync(),
                 "ffmpeg_progress_clock_alignment": clock_alignment,
                 "timing_strategy_validation": {
                     "expected_media_to_wall_ratio": 1.0,
@@ -2342,12 +2639,14 @@ class SmoothnessDiagnosticsMixin:
                     "clock_alignment_json": str(self.session_clock_alignment_path),
                     "ffmpeg_command_and_stderr": str(self.session_ffmpeg_path),
                     "recording_text_log": str(self.current_log_path),
+                    "coreaudio_sync_json": str(getattr(self, "session_audio_sync_path", None)),
                 },
                 "known_limits": [
                     "Даже motion-qualified кандидат не является абсолютным доказательством: приложение или видео могли законно остановить движение.",
                     "nvidia-smi is sampled only every 15 seconds to avoid adding recording load.",
                     "If psutil is unavailable, CPU/process/disk metrics are less detailed.",
                     "Player/display judder can exist even when the encoded file cadence is correct; compare in multiple players.",
+                    "CoreAudio recovery считается проверенным только когда recovery_path_exercised=true в файле 15.",
                 ],
             }
             self.last_ai_smoothness_report = report

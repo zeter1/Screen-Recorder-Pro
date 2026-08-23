@@ -3,9 +3,12 @@ from __future__ import annotations
 import ast
 import compileall
 import inspect
+import json
 import queue
 import sys
+import tempfile
 import threading
+import wave
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -87,6 +90,8 @@ def main() -> int:
         "_stop_native_screenshot_hotkey", "_is_native_screenshot_hotkey_healthy",
         "_enqueue_screenshot_hotkey_from_backend",
         "_is_owned_problem_log_item",
+        "build_python_loopback_sync_plan", "build_python_loopback_audio_filter",
+        "summarize_python_loopback_audio_sync", "classify_visual_motion_window",
     }
     missing = sorted(required - methods)
     if missing:
@@ -107,6 +112,202 @@ def main() -> int:
     if valid != "Stereo Mix (Realtek Audio)":
         print("ОШИБКА: Stereo Mix не был найден:", valid)
         return 1
+
+    print("4б. Регрессионная проверка восстановления CoreAudio loopback...")
+    from screen_recorder.components.audio_loopback import (
+        WasapiLoopbackWaveRecorder,
+        _CoreAudioHRESULTError,
+    )
+
+    if not WasapiLoopbackWaveRecorder.is_retryable_hresult(0x88890004):
+        print("ОШИБКА: AUDCLNT_E_DEVICE_INVALIDATED не распознан как восстанавливаемая ошибка.")
+        return 1
+    if WasapiLoopbackWaveRecorder.is_retryable_hresult(0x80004005):
+        print("ОШИБКА: произвольный HRESULT ошибочно признан восстанавливаемым.")
+        return 1
+    if not ScreenRecorderProWin11.is_python_loopback_duration_incomplete(30.0, 12.0):
+        print("ОШИБКА: сильно укороченный CoreAudio WAV не распознан.")
+        return 1
+    if ScreenRecorderProWin11.is_python_loopback_duration_incomplete(30.0, 29.5):
+        print("ОШИБКА: допустимая разница длительности CoreAudio ошибочно признана обрывом.")
+        return 1
+
+    early_plan = ScreenRecorderProWin11.build_python_loopback_sync_plan(100.0, 101.25)
+    if early_plan.get("correction_action") != "trim_early_loopback_audio" or abs(
+        float(early_plan.get("trim_loopback_start_seconds") or 0.0) - 1.25
+    ) > 0.000001:
+        print("ОШИБКА: ранний CoreAudio WAV не получил точный trim-план:", early_plan)
+        return 1
+    early_filter = ScreenRecorderProWin11.build_python_loopback_audio_filter(early_plan)
+    if "atrim=start=1.250000" not in early_filter or "asetpts=PTS-STARTPTS" not in early_filter:
+        print("ОШИБКА: trim-план не попал в FFmpeg audio-filter:", early_filter)
+        return 1
+
+    late_plan = ScreenRecorderProWin11.build_python_loopback_sync_plan(102.0, 100.0)
+    late_filter = ScreenRecorderProWin11.build_python_loopback_audio_filter(late_plan)
+    if late_plan.get("correction_action") != "delay_late_loopback_audio" or "adelay=2000|2000" not in late_filter:
+        print("ОШИБКА: поздний CoreAudio WAV не получил точный delay-план:", late_plan, late_filter)
+        return 1
+
+    aligned_plan = ScreenRecorderProWin11.build_python_loopback_sync_plan(100.0, 100.01)
+    if aligned_plan.get("correction_action") != "none_already_aligned":
+        print("ОШИБКА: микросдвиг CoreAudio ошибочно требует коррекции:", aligned_plan)
+        return 1
+
+    bursty_motion = ScreenRecorderProWin11.classify_visual_motion_window(
+        [0, 1, 2, 32, 33, 34, 65, 66],
+        72,
+        72,
+    )
+    if bursty_motion.get("motion_pattern_classification") != "bursty_or_interrupted_motion":
+        print("ОШИБКА: прокрутка порциями не отделена от непрерывного движения:", bursty_motion)
+        return 1
+    continuous_motion = ScreenRecorderProWin11.classify_visual_motion_window(range(60), 72, 72)
+    if continuous_motion.get("motion_pattern_classification") != "continuous_motion":
+        print("ОШИБКА: непрерывное движение ошибочно классифицировано:", continuous_motion)
+        return 1
+
+    diagnostics_app = ScreenRecorderProWin11.__new__(ScreenRecorderProWin11)
+    healthy_bursty_verdict = diagnostics_app.build_automatic_smoothness_verdict(
+        {"timing_health": {"status": "ok"}},
+        {
+            "moving_content_cadence_analysis": {
+                "low_cadence_window_count": 1,
+                "strong_continuous_low_cadence_window_count": 0,
+                "bursty_or_stepwise_low_cadence_window_count": 1,
+            },
+            "suspected_freeze_candidates": [],
+            "exact_duplicate_like_percent": 70.0,
+        },
+        {
+            "total_dup_frames_across_segments": 0,
+            "total_drop_frames_across_segments": 0,
+            "possible_progress_stalls_count": 0,
+            "steady_speed_median_after_3s": 1.0,
+        },
+        {
+            "memory_percent": {"max": 88.0},
+            "swap_percent": {"max": 12.0},
+            "swap_in_bytes_during_recording": 0,
+            "swap_out_bytes_during_recording": 0,
+        },
+        clock_alignment={"status": "clocks_aligned", "aggregate": {}},
+        candidate_evidence=[],
+    )
+    if healthy_bursty_verdict.get("status") != "healthy_with_observations" or healthy_bursty_verdict.get("warnings"):
+        print("ОШИБКА: bursty-прокрутка/RAM без swap ошибочно понизили здоровье записи:", healthy_bursty_verdict)
+        return 1
+
+    correlated_verdict = diagnostics_app.build_automatic_smoothness_verdict(
+        {"timing_health": {"status": "ok"}},
+        {
+            "moving_content_cadence_analysis": {
+                "low_cadence_window_count": 1,
+                "strong_continuous_low_cadence_window_count": 1,
+                "bursty_or_stepwise_low_cadence_window_count": 0,
+            },
+            "suspected_freeze_candidates": [],
+        },
+        {
+            "total_dup_frames_across_segments": 0,
+            "total_drop_frames_across_segments": 0,
+            "possible_progress_stalls_count": 0,
+            "steady_speed_median_after_3s": 1.0,
+        },
+        {},
+        clock_alignment={"status": "clocks_aligned", "aggregate": {}},
+        candidate_evidence=[{
+            "candidate": {"candidate_kind": "continuous_low_cadence"},
+            "technical_correlation_signals": ["ffmpeg_speed_below_0_90"],
+        }],
+    )
+    if correlated_verdict.get("status") != "healthy_with_warnings":
+        print("ОШИБКА: технически подтверждённый low-cadence кандидат не дал предупреждение:", correlated_verdict)
+        return 1
+
+    diagnostics_app.python_loopback_sync_metadata = {
+        "segment.mp4": {
+            "segment_path": "segment.mp4",
+            "status": "mixed",
+            "alignment_applied": True,
+            "sync_plan": {"correction_action": "trim_early_loopback_audio"},
+            "endpoint_invalidations": 0,
+            "reconnect_attempts": 0,
+            "reconnect_successes": 0,
+        }
+    }
+    audio_sync_summary = diagnostics_app.summarize_python_loopback_audio_sync()
+    if audio_sync_summary.get("status") != "aligned_with_applied_correction" or audio_sync_summary.get("recovery_path_exercised"):
+        print("ОШИБКА: сводка A/V-якоря CoreAudio недостоверна:", audio_sync_summary)
+        return 1
+    with tempfile.TemporaryDirectory(prefix="screen_recorder_audio_sync_log_test_") as temp_dir:
+        diagnostics_app.session_audio_sync_path = Path(temp_dir) / "15_audio_sync.json"
+        diagnostics_app.log_exception = lambda *args, **kwargs: None
+        diagnostics_app.write_python_loopback_audio_sync_report()
+        saved_audio_sync = json.loads(diagnostics_app.session_audio_sync_path.read_text(encoding="utf-8"))
+        if saved_audio_sync.get("status") != "aligned_with_applied_correction":
+            print("ОШИБКА: отдельный файл 15 не сохранил сводку A/V-якоря:", saved_audio_sync)
+            return 1
+
+    with tempfile.TemporaryDirectory(prefix="screen_recorder_loopback_test_") as temp_dir:
+        output_wav = Path(temp_dir) / "loopback.wav"
+        recorder = WasapiLoopbackWaveRecorder(output_wav)
+        reconnect_wav = recorder._part_path(output_wav, 1)
+        for wav_path, frame_count in ((output_wav, 100), (reconnect_wav, 200)):
+            with wave.open(str(wav_path), "wb") as test_wav:
+                test_wav.setnchannels(2)
+                test_wav.setsampwidth(2)
+                test_wav.setframerate(48000)
+                test_wav.writeframes(b"\x00" * frame_count * 4)
+        recorder._merge_wav_parts([output_wav, reconnect_wav])
+        with wave.open(str(output_wav), "rb") as merged_wav:
+            if merged_wav.getnframes() != 300:
+                print("ОШИБКА: reconnect WAV-фрагменты объединены с потерей кадров.")
+                return 1
+        if reconnect_wav.exists():
+            print("ОШИБКА: временный reconnect WAV не очищен после успешного объединения.")
+            return 1
+
+        class SyntheticReconnectRecorder(WasapiLoopbackWaveRecorder):
+            RECONNECT_INTERVAL_SECONDS = 0.0
+
+            def _run_capture_session(self, output_path, capture_start_perf, session_index=0):
+                frame_count = 100 if session_index == 0 else 200
+                with wave.open(str(output_path), "wb") as test_wav:
+                    test_wav.setnchannels(2)
+                    test_wav.setsampwidth(2)
+                    test_wav.setframerate(48000)
+                    test_wav.writeframes(b"\x00" * frame_count * 4)
+                if session_index == 0:
+                    raise _CoreAudioHRESULTError("synthetic GetNextPacketSize", 0x88890004)
+
+        recovered_wav = Path(temp_dir) / "synthetic_recovered.wav"
+        recovered = SyntheticReconnectRecorder(recovered_wav)
+        recovered.capture_start_perf = 1.0
+        recovered._run()
+        if recovered.error is not None or recovered.endpoint_invalidations != 1 or recovered.reconnect_attempts != 1:
+            print(
+                "ОШИБКА: синтетическое отключение CoreAudio не восстановлено:",
+                recovered.error,
+                recovered.endpoint_invalidations,
+                recovered.reconnect_attempts,
+            )
+            return 1
+        with wave.open(str(recovered_wav), "rb") as recovered_file:
+            if recovered_file.getnframes() != 300:
+                print("ОШИБКА: после восстановления CoreAudio потеряны WAV-кадры.")
+                return 1
+
+        recorder.error = RuntimeError("synthetic loopback failure")
+        try:
+            recorder.stop(timeout=0.01)
+        except RuntimeError as exc:
+            if "synthetic loopback failure" not in str(exc):
+                print("ОШИБКА: stop() потерял исходную ошибку CoreAudio:", exc)
+                return 1
+        else:
+            print("ОШИБКА: stop() замаскировал ошибку CoreAudio как успех.")
+            return 1
 
     print("5. Регрессионная проверка выделения скриншота и безопасной очистки логов...")
     region, details = ScreenRecorderProWin11.normalize_capture_region_drag(100, 200, 180, 260)

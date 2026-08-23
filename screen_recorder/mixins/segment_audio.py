@@ -3,6 +3,179 @@ from ..components.audio_loopback import WasapiLoopbackWaveRecorder
 
 
 class SegmentAudioMixin:
+    @staticmethod
+    def is_python_loopback_duration_incomplete(video_duration, loopback_duration, tolerance_seconds=1.0):
+        try:
+            video_seconds = max(0.0, float(video_duration))
+            loopback_seconds = max(0.0, float(loopback_duration))
+            tolerance = max(0.1, float(tolerance_seconds))
+        except (TypeError, ValueError):
+            return False
+        return video_seconds > 0.0 and loopback_seconds + tolerance < video_seconds
+
+    @staticmethod
+    def build_python_loopback_sync_plan(loopback_start_perf, video_start_perf, ignore_below_seconds=0.02):
+        """Строит однозначный план выравнивания WAV относительно первого видеокадра."""
+        try:
+            loopback_start = float(loopback_start_perf)
+            video_start = float(video_start_perf)
+            threshold = max(0.0, float(ignore_below_seconds))
+        except (TypeError, ValueError):
+            return {
+                "status": "unknown_missing_monotonic_anchor",
+                "anchor_source": "ffmpeg_first_real_frame_estimate",
+                "loopback_start_minus_video_start_seconds": None,
+                "trim_loopback_start_seconds": 0.0,
+                "delay_loopback_start_seconds": 0.0,
+                "correction_action": "none_unknown_anchor",
+            }
+
+        offset = loopback_start - video_start
+        trim_seconds = max(0.0, -offset)
+        delay_seconds = max(0.0, offset)
+        if abs(offset) <= threshold:
+            trim_seconds = 0.0
+            delay_seconds = 0.0
+            action = "none_already_aligned"
+            status = "aligned_within_threshold"
+        elif trim_seconds > 0.0:
+            action = "trim_early_loopback_audio"
+            status = "correction_required"
+        else:
+            action = "delay_late_loopback_audio"
+            status = "correction_required"
+        return {
+            "status": status,
+            "anchor_source": "ffmpeg_first_real_frame_estimate",
+            "loopback_start_minus_video_start_seconds": round(offset, 6),
+            "trim_loopback_start_seconds": round(trim_seconds, 6),
+            "delay_loopback_start_seconds": round(delay_seconds, 6),
+            "correction_action": action,
+            "ignore_below_seconds": round(threshold, 6),
+        }
+
+    @staticmethod
+    def build_python_loopback_audio_filter(sync_plan):
+        """Возвращает FFmpeg audio-filter с применением рассчитанного A/V-якоря."""
+        sync_plan = sync_plan or {}
+        try:
+            trim_seconds = max(0.0, float(sync_plan.get("trim_loopback_start_seconds") or 0.0))
+        except (TypeError, ValueError):
+            trim_seconds = 0.0
+        try:
+            delay_seconds = max(0.0, float(sync_plan.get("delay_loopback_start_seconds") or 0.0))
+        except (TypeError, ValueError):
+            delay_seconds = 0.0
+        parts = []
+        if trim_seconds > 0.0:
+            parts.append(f"atrim=start={trim_seconds:.6f}")
+        parts.extend([
+            "asetpts=PTS-STARTPTS",
+            "aresample=48000:async=1:first_pts=0",
+            "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
+        ])
+        if delay_seconds > 0.0:
+            delay_ms = max(1, int(round(delay_seconds * 1000.0)))
+            parts.append(f"adelay={delay_ms}|{delay_ms}")
+        return ",".join(parts)
+
+    def summarize_python_loopback_audio_sync(self):
+        metadata = getattr(self, "python_loopback_sync_metadata", {}) or {}
+        segments = [dict(value) for _key, value in sorted(metadata.items()) if isinstance(value, dict)]
+        if not segments:
+            return {
+                "schema": "screen_recorder_coreaudio_sync_v1",
+                "status": "not_used",
+                "segment_count": 0,
+                "recovery_path_exercised": False,
+                "segments": [],
+            }
+        incomplete = [item for item in segments if item.get("status") in {"incomplete", "error"}]
+        unverified = [item for item in segments if item.get("status") == "mixed_probe_failed"]
+        corrected = [
+            item for item in segments
+            if (item.get("sync_plan") or {}).get("correction_action") in {
+                "trim_early_loopback_audio", "delay_late_loopback_audio"
+            }
+        ]
+        invalidations = sum(int(item.get("endpoint_invalidations") or 0) for item in segments)
+        reconnect_attempts = sum(int(item.get("reconnect_attempts") or 0) for item in segments)
+        reconnect_successes = sum(int(item.get("reconnect_successes") or 0) for item in segments)
+        if incomplete:
+            status = "incomplete"
+        elif unverified:
+            status = "alignment_applied_but_final_probe_failed"
+        elif corrected:
+            status = "aligned_with_applied_correction" if all(item.get("alignment_applied") for item in corrected) else "correction_pending"
+        else:
+            status = "aligned_or_anchor_unavailable"
+        return {
+            "schema": "screen_recorder_coreaudio_sync_v1",
+            "status": status,
+            "segment_count": len(segments),
+            "corrected_segment_count": len(corrected),
+            "incomplete_segment_count": len(incomplete),
+            "endpoint_invalidation_observed": invalidations > 0,
+            "endpoint_invalidation_count": invalidations,
+            "recovery_path_exercised": reconnect_attempts > 0,
+            "reconnect_attempts": reconnect_attempts,
+            "reconnect_successes": reconnect_successes,
+            "recovery_result": (
+                "not_exercised_no_invalidation"
+                if invalidations == 0 else
+                "recovered"
+                if reconnect_successes > 0 and not incomplete else
+                "incomplete_or_failed"
+            ),
+            "segments": segments,
+            "note_for_ai": (
+                "Положительный loopback_start_minus_video_start означает поздний звук и требует delay; "
+                "отрицательный означает ранний звук и требует trim. Статус not_exercised не проверяет recovery-путь."
+            ),
+        }
+
+    def write_python_loopback_audio_sync_report(self):
+        report = self.summarize_python_loopback_audio_sync()
+        path = getattr(self, "session_audio_sync_path", None)
+        if path:
+            try:
+                atomic_write_text(path, json.dumps(report, ensure_ascii=False, indent=2))
+            except Exception as exc:
+                try:
+                    self.log_exception("write_python_loopback_audio_sync_report", exc)
+                except Exception:
+                    pass
+        return report
+
+    def mark_system_audio_incomplete(self, details, segment=None):
+        details = str(details or "неизвестная ошибка CoreAudio").strip()
+        reason = f"Системный звук записан не полностью: {details}"
+        existing = str(getattr(self, "recording_failure_reason", "") or "").strip()
+        if reason not in existing:
+            self.recording_failure_reason = f"{existing}\n{reason}".strip() if existing else reason
+        if segment is not None:
+            try:
+                key = str(Path(segment))
+                metadata = self.python_loopback_sync_metadata.setdefault(key, {"segment_path": key})
+                metadata["status"] = "incomplete"
+                metadata["error"] = details
+                self.write_python_loopback_audio_sync_report()
+            except Exception:
+                pass
+        try:
+            self.problem_log_event("python_loopback_incomplete", {
+                "segment_path": segment,
+                "details": details,
+                "recording_failure_reason": self.recording_failure_reason,
+                "note_for_ai": (
+                    "Видео и доступная часть звука сохраняются, но пользователь обязательно получает "
+                    "предупреждение: обязательный системный звук неполный."
+                ),
+            }, level="ERROR")
+        except Exception:
+            pass
+        self.log_message(reason)
+
     def should_capture_system_audio_with_python_loopback(self, system_choice=None):
         """True, если системный звук надо писать не через FFmpeg, а напрямую CoreAudio.
 
@@ -49,7 +222,8 @@ class SegmentAudioMixin:
         # старта сегмента, а не от клика по кнопке «Запись». Иначе при включённом
         # отсчёте 3-2-1 WAV начинался бы с лишней тишины и системный звук уезжал бы
         # относительно видео.
-        recorder.start(startup_wait=0.0, start_perf=time.perf_counter())
+        loopback_start_perf = time.perf_counter()
+        recorder.start(startup_wait=0.0, start_perf=loopback_start_perf)
         try:
             if self.log_handle:
                 self.log_handle.write("python_coreaudio_loopback_start_wait=0.0s\n")
@@ -60,6 +234,29 @@ class SegmentAudioMixin:
         self.current_python_loopback_segment = Path(segment_path)
         self.current_python_loopback_path = wav_path
         self.python_loopback_audio_segments[str(Path(segment_path))] = wav_path
+        segment_key = str(Path(segment_path))
+        self.python_loopback_sync_metadata[segment_key] = {
+            "status": "recording",
+            "segment_path": segment_key,
+            "wav_path": str(wav_path),
+            "role": role,
+            "loopback_capture_start_perf": round(float(recorder.capture_start_perf), 6),
+            "video_capture_start_perf": None,
+            "sync_plan": self.build_python_loopback_sync_plan(None, None),
+            "alignment_applied": False,
+            "endpoint_invalidations": 0,
+            "reconnect_attempts": 0,
+            "reconnect_successes": 0,
+            "recovery_path_exercised": False,
+        }
+        self.write_python_loopback_audio_sync_report()
+        self.problem_log_event("python_loopback_capture_started", {
+            "segment_path": segment_key,
+            "wav_path": wav_path,
+            "role": role,
+            "loopback_capture_start_perf": round(float(recorder.capture_start_perf), 6),
+            "timeline_policy": "record early if needed, then trim/delay against ffmpeg first-real-frame monotonic anchor",
+        })
         try:
             self.status_var.set("Системный звук пишется напрямую через Windows CoreAudio loopback.")
         except Exception:
@@ -74,6 +271,14 @@ class SegmentAudioMixin:
         self.current_python_loopback_segment = None
         if recorder is None:
             return None
+
+        segment_key = str(Path(segment)) if segment is not None else None
+        metadata = None
+        if segment_key:
+            metadata = self.python_loopback_sync_metadata.setdefault(segment_key, {
+                "segment_path": segment_key,
+                "wav_path": str(wav_path) if wav_path else None,
+            })
 
         stop_error = None
         finished = False
@@ -90,12 +295,45 @@ class SegmentAudioMixin:
             except Exception:
                 finished = False
         finally:
+            recorder_error = getattr(recorder, "error", None)
+            if recorder_error is not None and stop_error is None:
+                stop_error = recorder_error
+            video_start_perf = getattr(self, "segment_capture_started_perf", None)
+            sync_plan = self.build_python_loopback_sync_plan(
+                getattr(recorder, "capture_start_perf", None),
+                video_start_perf,
+            )
+            if metadata is not None:
+                audio_client_started_perf = getattr(recorder, "audio_client_started_perf", None)
+                metadata.update({
+                    "status": "incomplete" if stop_error is not None else "captured_pending_mix",
+                    "loopback_capture_start_perf": getattr(recorder, "capture_start_perf", None),
+                    "audio_client_started_perf": audio_client_started_perf,
+                    "audio_client_ready_after_loopback_start_seconds": (
+                        round(float(audio_client_started_perf) - float(recorder.capture_start_perf), 6)
+                        if audio_client_started_perf is not None and recorder.capture_start_perf is not None else None
+                    ),
+                    "video_capture_start_perf": video_start_perf,
+                    "sync_plan": sync_plan,
+                    "endpoint_invalidations": int(getattr(recorder, "endpoint_invalidations", 0) or 0),
+                    "reconnect_attempts": int(getattr(recorder, "reconnect_attempts", 0) or 0),
+                    "reconnect_successes": int(getattr(recorder, "reconnect_successes", 0) or 0),
+                    "recovery_path_exercised": bool(getattr(recorder, "reconnect_attempts", 0)),
+                    "stop_error": repr(stop_error) if stop_error else None,
+                })
             try:
                 size = Path(wav_path).stat().st_size if wav_path and Path(wav_path).exists() else 0
+                if metadata is not None:
+                    metadata["wav_size_bytes"] = int(size)
                 if self.log_handle:
                     self.log_handle.write(
                         f"python_coreaudio_loopback_stop={wav_path}, size={size}, "
-                        f"finished={finished}, error={repr(stop_error) if stop_error else ''}\n"
+                        f"finished={finished}, error={repr(stop_error) if stop_error else ''}, "
+                        f"endpoint_invalidations={getattr(recorder, 'endpoint_invalidations', 0)}, "
+                        f"reconnect_attempts={getattr(recorder, 'reconnect_attempts', 0)}, "
+                        f"reconnect_successes={getattr(recorder, 'reconnect_successes', 0)}, "
+                        f"sync_action={sync_plan.get('correction_action')}, "
+                        f"loopback_start_minus_video={sync_plan.get('loopback_start_minus_video_start_seconds')}\n"
                     )
                     self.log_handle.flush()
                 if segment and wav_path and finished and size > 44:
@@ -107,17 +345,37 @@ class SegmentAudioMixin:
                     )
             except Exception:
                 pass
+            try:
+                self.problem_log_event("python_loopback_capture_stopped", {
+                    "segment_path": segment_key,
+                    "wav_path": wav_path,
+                    "finished": finished,
+                    "error": repr(stop_error) if stop_error else None,
+                    "sync_plan": sync_plan,
+                    "endpoint_invalidations": int(getattr(recorder, "endpoint_invalidations", 0) or 0),
+                    "reconnect_attempts": int(getattr(recorder, "reconnect_attempts", 0) or 0),
+                    "reconnect_successes": int(getattr(recorder, "reconnect_successes", 0) or 0),
+                    "recovery_path_exercised": bool(getattr(recorder, "reconnect_attempts", 0)),
+                }, level="ERROR" if stop_error else "INFO")
+                self.write_python_loopback_audio_sync_report()
+            except Exception:
+                pass
         try:
             size = Path(wav_path).stat().st_size if wav_path and Path(wav_path).exists() else 0
         except Exception:
             size = 0
         if stop_error is not None:
-            raise RuntimeError(f"CoreAudio loopback остановился с ошибкой: {stop_error}") from stop_error
-        if not finished or size <= 44:
-            raise RuntimeError(
-                f"CoreAudio loopback WAV не был корректно завершён: {wav_path}, "
-                f"finished={finished}, size={size}. Итоговый файл не будет собран молча без системного звука."
+            self.mark_system_audio_incomplete(
+                f"CoreAudio loopback остановился с ошибкой: {stop_error}",
+                segment=segment,
             )
+            return wav_path if finished and size > 44 else None
+        if not finished or size <= 44:
+            self.mark_system_audio_incomplete(
+                f"WAV не был корректно завершён: {wav_path}, finished={finished}, size={size}",
+                segment=segment,
+            )
+            return None
         return wav_path
 
     def media_has_audio_stream(self, path):
@@ -205,13 +463,20 @@ class SegmentAudioMixin:
     def mix_python_loopback_audio_into_segment(self, segment_path, wav_path, output_path):
         has_segment_audio = self.media_has_audio_stream(segment_path)
         audio_bitrate = self.get_recording_audio_bitrate_safe()
+        segment_key = str(Path(segment_path))
+        metadata = self.python_loopback_sync_metadata.setdefault(segment_key, {
+            "segment_path": segment_key,
+            "wav_path": str(wav_path),
+        })
+        sync_plan = dict(metadata.get("sync_plan") or self.build_python_loopback_sync_plan(None, None))
+        loopback_filter = self.build_python_loopback_audio_filter(sync_plan)
 
         # Сохраняем длительности ДО смешивания. В прошлых логах звук был длиннее
         # ускоренного видеопотока, а -shortest скрывал это, обрезая конец аудио.
         # Теперь такая ситуация остаётся видимой в JSONL даже если итоговый файл
         # после apad/-shortest формально имеет одинаковые границы дорожек.
         try:
-            source_video_timing = self.probe_av_stream_timing(segment_path)
+            source_video_timing = self.probe_av_stream_timing(segment_path) or {}
         except Exception as exc:
             source_video_timing = {"probe_error": repr(exc)}
         try:
@@ -226,17 +491,59 @@ class SegmentAudioMixin:
                 if source_loopback_duration is not None and video_duration_before is not None
                 else None
             )
+            trim_seconds = max(0.0, float(sync_plan.get("trim_loopback_start_seconds") or 0.0))
+            delay_seconds = max(0.0, float(sync_plan.get("delay_loopback_start_seconds") or 0.0))
+            if source_loopback_duration is not None and trim_seconds >= max(0.0, float(source_loopback_duration) - 0.25):
+                raise RuntimeError(
+                    "Рассчитанная обрезка начала CoreAudio исчерпывает WAV: "
+                    f"trim={trim_seconds:.3f} с, wav={float(source_loopback_duration):.3f} с."
+                )
+            effective_loopback_timeline_duration = (
+                max(0.0, float(source_loopback_duration) - trim_seconds) + delay_seconds
+                if source_loopback_duration is not None else None
+            )
+            if self.is_python_loopback_duration_incomplete(
+                video_duration_before,
+                effective_loopback_timeline_duration,
+            ):
+                shortfall = float(video_duration_before) - float(effective_loopback_timeline_duration)
+                self.mark_system_audio_incomplete(
+                    f"выровненная шкала WAV короче видео на {shortfall:.3f} с "
+                    f"({effective_loopback_timeline_duration:.3f} с против {video_duration_before:.3f} с)",
+                    segment=segment_path,
+                )
+            metadata.update({
+                "source_video_timing": source_video_timing,
+                "source_loopback_duration_seconds": source_loopback_duration,
+                "source_audio_minus_video_seconds": duration_difference_before,
+                "effective_loopback_timeline_duration_seconds": effective_loopback_timeline_duration,
+                "ffmpeg_loopback_filter": loopback_filter,
+            })
             self.problem_log_event("python_loopback_mix_timing_before", {
                 "segment_path": segment_path,
                 "wav_path": wav_path,
                 "video_timing": source_video_timing,
                 "loopback_wav_duration_seconds": source_loopback_duration,
                 "audio_minus_video_seconds_before_mix": duration_difference_before,
+                "effective_loopback_timeline_duration_seconds": effective_loopback_timeline_duration,
+                "sync_plan": sync_plan,
+                "ffmpeg_loopback_filter": loopback_filter,
                 "has_segment_audio": has_segment_audio,
-                "mix_policy": "audio is resampled, padded when short, and bounded by video with -shortest",
+                "mix_policy": (
+                    "loopback is trimmed/delayed against the first-real-video-frame monotonic anchor, "
+                    "then resampled, padded when short, and bounded by video with -shortest"
+                ),
             })
-        except Exception:
-            pass
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            metadata["timing_probe_error"] = repr(exc)
+            self.problem_log_event("python_loopback_mix_timing_before_probe_failed", {
+                "segment_path": segment_path,
+                "wav_path": wav_path,
+                "error": repr(exc),
+                "sync_plan": sync_plan,
+            }, level="WARN")
 
         command = [
             self.ffmpeg_path,
@@ -254,8 +561,7 @@ class SegmentAudioMixin:
                 "-filter_complex",
                 "[0:a:0]aresample=48000:async=1:first_pts=0,"
                 "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a0];"
-                "[1:a:0]aresample=48000:async=1:first_pts=0,"
-                "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a1];"
+                f"[1:a:0]{loopback_filter}[a1];"
                 "[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
                 "alimiter=limit=0.95,apad[aout]",
                 "-map",
@@ -283,7 +589,7 @@ class SegmentAudioMixin:
                 "-c:v",
                 "copy",
                 "-af",
-                "aresample=48000:async=1:first_pts=0,apad",
+                f"{loopback_filter},apad",
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -314,6 +620,17 @@ class SegmentAudioMixin:
             raise RuntimeError(f"Не удалось подмешать системный звук CoreAudio. {(result.stderr or '').strip()}")
         try:
             mixed_timing = self.probe_av_stream_timing(output_path)
+            metadata.update({
+                "status": "incomplete" if metadata.get("status") == "incomplete" else "mixed",
+                "alignment_applied": True,
+                "mixed_output_path": str(output_path),
+                "mixed_timing": mixed_timing,
+                "video_minus_audio_end_seconds": (
+                    float(mixed_timing.get("video_end")) - float(mixed_timing.get("audio_end"))
+                    if mixed_timing.get("video_end") is not None and mixed_timing.get("audio_end") is not None
+                    else None
+                ),
+            })
             self.problem_log_event("python_loopback_mix_timing_after", {
                 "output_path": output_path,
                 "mixed_timing": mixed_timing,
@@ -322,12 +639,21 @@ class SegmentAudioMixin:
                     if mixed_timing.get("video_end") is not None and mixed_timing.get("audio_end") is not None
                     else None
                 ),
+                "sync_plan_applied": sync_plan,
             })
+            self.write_python_loopback_audio_sync_report()
         except Exception as exc:
+            metadata.update({
+                "status": "incomplete" if metadata.get("status") == "incomplete" else "mixed_probe_failed",
+                "alignment_applied": True,
+                "mixed_output_path": str(output_path),
+                "mixed_probe_error": repr(exc),
+            })
             self.problem_log_event("python_loopback_mix_timing_after_probe_failed", {
                 "output_path": output_path,
                 "error": repr(exc),
             }, level="WARN")
+            self.write_python_loopback_audio_sync_report()
 
     def probe_av_stream_timing(self, path):
         """Возвращает границы первой видео- и аудиодорожки через ffprobe."""

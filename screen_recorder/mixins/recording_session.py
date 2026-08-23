@@ -123,6 +123,8 @@ class RecordingSessionMixin:
             self.temp_dir = temp_root / self.recording_session_id
             self.temp_dir.mkdir(parents=True, exist_ok=True)
             self.segments = []
+            self.python_loopback_audio_segments = {}
+            self.python_loopback_sync_metadata = {}
             self.segment_index = 0
             self.recorded_seconds = 0.0
             self.recorded_wall_seconds = 0.0
