@@ -84,8 +84,8 @@ except Exception:
 DXCAM_CAPTURE_ENABLED = False
 
 APP_NAME = "ScreenRecorderProWin11"
-APP_BUILD = "2026-08-16-audio-sync-diagnostics-v21"
-DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v17"
+APP_BUILD = "2026-08-24-recording-cursor-size-v24"
+DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v20"
 PROBLEM_LOGS_FOLDER_NAME = "Логи проблем"
 NO_AUDIO = "Не записывать"
 MIC_AUDIO_DEFAULT = "Микрофон (по умолчанию Windows)"
@@ -96,6 +96,7 @@ SYSTEM_AUDIO_WASAPI = "Звук компьютера (WASAPI loopback — авт
 WASAPI_RENDER_PREFIX = "WASAPI loopback: "
 WEBCAM_AUTO = "Авто (первая найденная)"
 VIDEO_FORMATS = ["mp4", "mkv", "avi", "mov"]
+RECORDING_CURSOR_SIZE_PERCENT_OPTIONS = (50, 75, 100, 125, 150, 175, 200, 250, 300)
 
 # Собственные инструменты скриншота. Значения хранятся в settings.json, поэтому
 # список и нормализаторы находятся в shared.py и одинаково используются UI,
@@ -519,6 +520,18 @@ def normalize_floating_panel_size(value, default=34):
     if number > 72:
         number = 72
     return number
+
+
+def normalize_recording_cursor_size_percent(value, default=100):
+    """Нормализует размер курсора в записи к одному из значений UI."""
+    try:
+        number = int(round(float(str(value).strip().rstrip("%").replace(",", "."))))
+    except Exception:
+        number = int(default)
+    return min(
+        RECORDING_CURSOR_SIZE_PERCENT_OPTIONS,
+        key=lambda option: (abs(option - number), abs(option - int(default))),
+    )
 
 
 def detect_primary_refresh_hz(default=60):

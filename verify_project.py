@@ -72,6 +72,8 @@ def main() -> int:
         APP_DIR,
         NO_AUDIO,
         Image,
+        RECORDING_CURSOR_SIZE_PERCENT_OPTIONS,
+        normalize_recording_cursor_size_percent,
         normalize_screenshot_annotation_color,
         normalize_screenshot_annotation_size,
     )
@@ -92,6 +94,9 @@ def main() -> int:
         "_is_owned_problem_log_item",
         "build_python_loopback_sync_plan", "build_python_loopback_audio_filter",
         "summarize_python_loopback_audio_sync", "classify_visual_motion_window",
+        "should_draw_native_recording_cursor", "get_recording_cursor_render_mode",
+        "build_cursor_overlay_geometry", "get_tk_toplevel_hwnd",
+        "position_cursor_overlay_window",
     }
     missing = sorted(required - methods)
     if missing:
@@ -109,6 +114,215 @@ def main() -> int:
     valid = ScreenRecorderProWin11.find_default_system_audio_device(
         ["Microphone", "Stereo Mix (Realtek Audio)"]
     )
+    print("3б. Регрессионная проверка размера курсора в записи...")
+    if tuple(RECORDING_CURSOR_SIZE_PERCENT_OPTIONS) != (50, 75, 100, 125, 150, 175, 200, 250, 300):
+        print("ОШИБКА: изменился поддерживаемый набор размеров курсора.")
+        return 1
+    for raw_value, expected in (
+        (None, 100),
+        ("bad", 100),
+        ("150%", 150),
+        (49, 50),
+        (88, 100),
+        (999, 300),
+    ):
+        actual = normalize_recording_cursor_size_percent(raw_value)
+        if actual != expected:
+            print("ОШИБКА: размер курсора нормализован неверно:", raw_value, actual, expected)
+            return 1
+
+    cursor_app = object.__new__(ScreenRecorderProWin11)
+    cursor_app.capture_region = None
+    cursor_app.recording_cursor_visible = True
+    cursor_app.recording_cursor_size_percent = 100
+    cursor_app.recording_custom_cursor_overlay_ready = False
+    if not cursor_app.should_draw_native_recording_cursor():
+        print("ОШИБКА: режим 100% перестал использовать настоящий системный курсор.")
+        return 1
+    native_source = cursor_app.build_ddagrab_source_expression(144, True, 0)
+    if "draw_mouse=1" not in native_source or "dup_frames=1" not in native_source:
+        print("ОШИБКА: системный курсор или dup_frames потерян в ddagrab:", native_source)
+        return 1
+
+    cursor_app.MP4_VIDEO_TRACK_TIMESCALE = 39600
+    stable_filter = cursor_app.build_smooth_video_filter(
+        72,
+        use_nvenc=True,
+        capture_backend="ddagrab",
+    )
+    if (
+        "RTCTIME-RTCSTART" not in stable_filter
+        or stable_filter.count("fps=72:round=near") != 1
+        or "setpts=N*" in stable_filter
+        or "hwdownload" in stable_filter
+    ):
+        print("ОШИБКА: настройка курсора изменила стабильный ddagrab/NVENC filter:", stable_filter)
+        return 1
+    encoder_command = []
+    cursor_app.should_use_hevc = lambda: False
+    cursor_app.append_encoder_options(
+        encoder_command,
+        72,
+        "16M",
+        "32M",
+        use_nvenc=True,
+        capture_backend="ddagrab",
+    )
+    if (
+        "-fps_mode" not in encoder_command
+        or encoder_command[encoder_command.index("-fps_mode") + 1] != "passthrough"
+        or "hwdownload" in encoder_command
+    ):
+        print("ОШИБКА: потерян fps_mode passthrough или GPU-direct NVENC:", encoder_command)
+        return 1
+    cursor_app.recording_refresh_hz = 144
+    if cursor_app.get_ddagrab_poll_fps(72) != 144:
+        print("ОШИБКА: 144 Гц / 72 FPS больше не даёт ddagrab poll 144.")
+        return 1
+
+    cursor_app.recording_cursor_size_percent = 200
+    cursor_app.recording_custom_cursor_overlay_ready = True
+    if cursor_app.should_draw_native_recording_cursor():
+        print("ОШИБКА: custom cursor создаёт двойной native-курсор.")
+        return 1
+    custom_source = cursor_app.build_ddagrab_source_expression(144, False, 0)
+    if "draw_mouse=0" not in custom_source:
+        print("ОШИБКА: native cursor не отключён при готовом custom overlay:", custom_source)
+        return 1
+    cursor_app.recording_custom_cursor_overlay_ready = False
+    if not cursor_app.should_draw_native_recording_cursor():
+        print("ОШИБКА: при сбое custom overlay не включается системный fallback.")
+        return 1
+    cursor_app.recording_cursor_visible = False
+    if cursor_app.should_draw_native_recording_cursor():
+        print("ОШИБКА: скрытый курсор снова включил native draw_mouse.")
+        return 1
+    if cursor_app.build_cursor_overlay_geometry(80, 90, -25, 10) != "80x90-25+10":
+        print("ОШИБКА: геометрия курсора не поддерживает отрицательные координаты монитора.")
+        return 1
+
+    command_source = inspect.getsource(ScreenRecorderProWin11.build_ffmpeg_command)
+    if command_source.count("should_draw_native_recording_cursor") < 2:
+        print("ОШИБКА: ddagrab и gdigrab используют разные правила cursor render mode.")
+        return 1
+    overlay_source = inspect.getsource(ScreenRecorderProWin11.start_cursor_highlight_overlay)
+    if (
+        "create_polygon" not in overlay_source
+        or "recording_custom_cursor_overlay_ready" not in overlay_source
+        or "if not self.make_window_clickthrough(win)" not in overlay_source
+        or "position_cursor_overlay_window" not in overlay_source
+    ):
+        print("ОШИБКА: custom cursor не подключён к безопасному owned click-through overlay.")
+        return 1
+    position_source = inspect.getsource(ScreenRecorderProWin11.position_cursor_overlay_window)
+    hwnd_source = inspect.getsource(ScreenRecorderProWin11.get_tk_toplevel_hwnd)
+    if "SetWindowPos" not in position_source or "GetAncestor" not in hwnd_source:
+        print("ОШИБКА: cursor overlay не поддерживает Tk wrapper HWND и абсолютные координаты.")
+        return 1
+
+    from screen_recorder.mixins import instant_buffer as instant_buffer_module
+
+    class FakeCursorWindow:
+        def __init__(self):
+            self.geometries = []
+            self.destroyed = False
+
+        def overrideredirect(self, _value):
+            return None
+
+        def attributes(self, *_args):
+            return None
+
+        def configure(self, **_kwargs):
+            return None
+
+        def wm_attributes(self, *_args):
+            return None
+
+        def geometry(self, value):
+            self.geometries.append(value)
+
+        def destroy(self):
+            self.destroyed = True
+
+    class FakeCursorCanvas:
+        def __init__(self):
+            self.polygons = []
+            self.ovals = []
+
+        def pack(self, **_kwargs):
+            return None
+
+        def create_polygon(self, *args, **kwargs):
+            self.polygons.append((args, kwargs))
+
+        def create_oval(self, *args, **kwargs):
+            self.ovals.append((args, kwargs))
+
+    class FakeCursorRoot:
+        def __init__(self):
+            self.cancelled = []
+
+        def after(self, _delay_ms, _callback):
+            return "cursor-job"
+
+        def after_cancel(self, job):
+            self.cancelled.append(job)
+
+    fake_window = FakeCursorWindow()
+    fake_canvas = FakeCursorCanvas()
+    original_toplevel = instant_buffer_module.tk.Toplevel
+    original_canvas = instant_buffer_module.tk.Canvas
+    instant_buffer_module.tk.Toplevel = lambda _root: fake_window
+    instant_buffer_module.tk.Canvas = lambda *_args, **_kwargs: fake_canvas
+    try:
+        cursor_app.root = FakeCursorRoot()
+        cursor_app.is_recording = True
+        cursor_app.is_finalizing = False
+        cursor_app.recording_cursor_visible = True
+        cursor_app.recording_cursor_size_percent = 200
+        cursor_app.recording_cursor_highlight = False
+        cursor_app.recording_cursor_highlight_size = 70
+        cursor_app.recording_custom_cursor_overlay_ready = False
+        cursor_app._cursor_highlight_window = None
+        cursor_app._cursor_highlight_canvas = None
+        cursor_app._cursor_highlight_job = None
+        cursor_app.get_cursor_position = lambda: (-10, 20)
+        cursor_app.make_window_clickthrough = lambda _window: True
+        cursor_app.position_cursor_overlay_window = lambda window, width, height, x, y: (
+            window.geometry(cursor_app.build_cursor_overlay_geometry(width, height, x, y)) is None
+        )
+        cursor_app.log_exception = lambda *_args, **_kwargs: None
+        custom_ready = cursor_app.start_cursor_highlight_overlay()
+        if (
+            not custom_ready
+            or not cursor_app.recording_custom_cursor_overlay_ready
+            or len(fake_canvas.polygons) != 2
+            or not fake_window.geometries
+        ):
+            print("ОШИБКА: custom cursor overlay не создаётся как единый owned Tk-объект.")
+            return 1
+        cursor_app.stop_cursor_highlight_overlay()
+        if (
+            cursor_app.recording_custom_cursor_overlay_ready
+            or not fake_window.destroyed
+            or "cursor-job" not in cursor_app.root.cancelled
+        ):
+            print("ОШИБКА: custom cursor overlay не очищает окно/job при остановке.")
+            return 1
+    finally:
+        instant_buffer_module.tk.Toplevel = original_toplevel
+        instant_buffer_module.tk.Canvas = original_canvas
+
+    recording_start_source = inspect.getsource(ScreenRecorderProWin11.start_recording)
+    if recording_start_source.find("start_cursor_highlight_overlay") > recording_start_source.find("start_new_segment"):
+        print("ОШИБКА: custom cursor запускается после первого кадра FFmpeg.")
+        return 1
+    settings_source = inspect.getsource(ScreenRecorderProWin11.save_settings)
+    if '"cursor_size_percent"' not in settings_source:
+        print("ОШИБКА: размер курсора не сохраняется в settings.json.")
+        return 1
+
     if valid != "Stereo Mix (Realtek Audio)":
         print("ОШИБКА: Stereo Mix не был найден:", valid)
         return 1

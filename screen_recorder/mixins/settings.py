@@ -80,6 +80,7 @@ class SettingsMixin:
             "draw_enabled": True,
             "floating_panel_size": normalize_floating_panel_size(self.floating_panel_size_var.get()),
             "cursor_visible": bool(self.cursor_visible_var.get()),
+            "cursor_size_percent": normalize_recording_cursor_size_percent(self.cursor_size_percent_var.get()),
             "cursor_highlight": bool(self.cursor_highlight_var.get()),
             "cursor_highlight_size": int(self.cursor_highlight_size_var.get()),
             "startup_tray": bool(self.startup_tray_var.get()),
@@ -159,10 +160,13 @@ class SettingsMixin:
             if not hasattr(self, "cursor_state_text"):
                 return
             visible = "виден" if self.cursor_visible_var.get() else "скрыт"
+            size_percent = normalize_recording_cursor_size_percent(self.cursor_size_percent_var.get())
             if self.cursor_highlight_var.get():
-                self.cursor_state_text.set(f"{visible}, подсветка {int(self.cursor_highlight_size_var.get())}")
+                self.cursor_state_text.set(
+                    f"{visible} {size_percent}%, подсветка {int(self.cursor_highlight_size_var.get())}"
+                )
             else:
-                self.cursor_state_text.set(f"{visible}, без подсветки")
+                self.cursor_state_text.set(f"{visible} {size_percent}%, без подсветки")
         except Exception:
             pass
 
@@ -225,6 +229,7 @@ class SettingsMixin:
             self.mic_volume_var,
             self.system_volume_var,
             self.cursor_visible_var,
+            self.cursor_size_percent_var,
             self.cursor_highlight_var,
             self.cursor_highlight_size_var,
             self.problem_logs_enabled_var,

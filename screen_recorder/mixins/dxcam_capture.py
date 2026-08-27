@@ -3,11 +3,17 @@ from ..shared import *
 
 class DxcamCaptureMixin:
     def refresh_recording_cursor_cache(self):
-        """Снимает Tk-параметры курсора в обычные Python-поля для DXcam-потока."""
+        """Снимает Tk-параметры курсора в обычные поля до запуска записи."""
         try:
             self.recording_cursor_visible = bool(self.cursor_visible_var.get())
         except Exception:
             self.recording_cursor_visible = True
+        try:
+            self.recording_cursor_size_percent = normalize_recording_cursor_size_percent(
+                self.cursor_size_percent_var.get()
+            )
+        except Exception:
+            self.recording_cursor_size_percent = 100
         try:
             self.recording_cursor_highlight = bool(self.cursor_highlight_var.get())
         except Exception:
@@ -17,6 +23,27 @@ class DxcamCaptureMixin:
         except Exception:
             size = 70
         self.recording_cursor_highlight_size = max(20, min(200, size))
+
+    def should_draw_native_recording_cursor(self):
+        """Native FFmpeg cursor используется, пока custom overlay не готов."""
+        if not bool(getattr(self, "recording_cursor_visible", True)):
+            return False
+        size_percent = normalize_recording_cursor_size_percent(
+            getattr(self, "recording_cursor_size_percent", 100)
+        )
+        if size_percent == 100:
+            return True
+        return not bool(getattr(self, "recording_custom_cursor_overlay_ready", False))
+
+    def get_recording_cursor_render_mode(self):
+        if not bool(getattr(self, "recording_cursor_visible", True)):
+            return "hidden"
+        if self.should_draw_native_recording_cursor():
+            size_percent = normalize_recording_cursor_size_percent(
+                getattr(self, "recording_cursor_size_percent", 100)
+            )
+            return "system" if size_percent == 100 else "system_fallback"
+        return "custom_overlay"
 
     def start_dxcam_segment(self, segment_path):
         if not DXCAM_AVAILABLE or os.name != "nt":

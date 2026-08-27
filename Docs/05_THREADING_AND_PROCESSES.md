@@ -45,7 +45,9 @@ recording_requested_fps
 recording_effective_fps
 recording_refresh_hz
 recording_cursor_visible
+recording_cursor_size_percent
 recording_cursor_highlight
+recording_cursor_highlight_size
 recording_settings_snapshot
 ```
 

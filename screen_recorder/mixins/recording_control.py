@@ -273,6 +273,11 @@ class RecordingControlMixin:
                 if self.segment_started_at is not None:
                     self.commit_current_segment_duration(segment_perf_end, reason="stop")
 
+            try:
+                self.root.after(0, self.stop_cursor_highlight_overlay)
+            except Exception as exc:
+                self.log_exception("stop_recording_worker.schedule_cursor_overlay_stop", exc)
+
             self.merge_segments()
             self.validate_media_file(self.output_path, label="итоговый файл")
             request_to_stop_seconds = None

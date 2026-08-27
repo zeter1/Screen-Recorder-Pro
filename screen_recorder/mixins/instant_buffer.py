@@ -1773,78 +1773,246 @@ class InstantBufferMixin:
         except Exception:
             pass
 
+    @staticmethod
+    def get_tk_toplevel_hwnd(window):
+        """Возвращает Win32 wrapper HWND, а не внутреннее client-окно Tk."""
+        if os.name != "nt" or window is None:
+            return 0
+        try:
+            window.update_idletasks()
+            client_hwnd = wintypes.HWND(int(window.winfo_id()))
+            get_ancestor = ctypes.windll.user32.GetAncestor
+            get_ancestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            get_ancestor.restype = wintypes.HWND
+            wrapper_hwnd = get_ancestor(client_hwnd, 2)  # GA_ROOT
+            return int(wrapper_hwnd or client_hwnd.value or 0)
+        except Exception:
+            return 0
+
     def make_window_clickthrough(self, window):
         """Делает оверлей некликабельным для мыши на Windows."""
         if os.name != "nt" or window is None:
-            return
+            return False
         try:
-            window.update_idletasks()
-            hwnd = int(window.winfo_id())
+            hwnd = self.get_tk_toplevel_hwnd(window)
+            if not hwnd:
+                return False
             user32 = ctypes.windll.user32
             GWL_EXSTYLE = -20
             WS_EX_LAYERED = 0x00080000
             WS_EX_TRANSPARENT = 0x00000020
             WS_EX_TOOLWINDOW = 0x00000080
+            required_style = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
             get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
             set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            get_long.argtypes = [wintypes.HWND, ctypes.c_int]
             get_long.restype = ctypes.c_ssize_t
+            set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
             set_long.restype = ctypes.c_ssize_t
-            style = get_long(hwnd, GWL_EXSTYLE)
-            set_long(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)
+            hwnd_value = wintypes.HWND(hwnd)
+            style = get_long(hwnd_value, GWL_EXSTYLE)
+            set_long(hwnd_value, GWL_EXSTYLE, style | required_style)
+            applied_style = get_long(hwnd_value, GWL_EXSTYLE)
+            return (applied_style & required_style) == required_style
         except Exception:
-            pass
+            return False
+
+    @staticmethod
+    def build_cursor_overlay_geometry(width, height, x, y):
+        """Строка geometry для fallback вне Win32-позиционирования."""
+        width = max(1, int(width))
+        height = max(1, int(height))
+        x = int(x)
+        y = int(y)
+        return f"{width}x{height}{x:+d}{y:+d}"
+
+    def position_cursor_overlay_window(self, window, width, height, x, y):
+        """Ставит overlay в абсолютные координаты виртуального экрана."""
+        if window is None:
+            return False
+        width = max(1, int(width))
+        height = max(1, int(height))
+        x = int(x)
+        y = int(y)
+        if os.name != "nt":
+            try:
+                window.geometry(self.build_cursor_overlay_geometry(width, height, x, y))
+                return True
+            except Exception:
+                return False
+        try:
+            hwnd = self.get_tk_toplevel_hwnd(window)
+            if not hwnd:
+                return False
+            HWND_TOPMOST = -1
+            SWP_NOACTIVATE = 0x0010
+            SWP_SHOWWINDOW = 0x0040
+            set_window_pos = ctypes.windll.user32.SetWindowPos
+            set_window_pos.argtypes = [
+                wintypes.HWND,
+                wintypes.HWND,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            ]
+            set_window_pos.restype = wintypes.BOOL
+            return bool(set_window_pos(
+                wintypes.HWND(hwnd),
+                wintypes.HWND(HWND_TOPMOST),
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            ))
+        except Exception:
+            return False
 
     def start_cursor_highlight_overlay(self):
-        """Видимая подсветка курсора для FFmpeg-захвата.
-
-        FFmpeg ddagrab/gdigrab умеет рисовать обычный курсор, но не умеет сам
-        рисовать круг вокруг него. Поэтому создаём маленькое прозрачное окно,
-        которое следует за мышью и попадает в запись как обычный topmost overlay.
-        """
+        """Один click-through overlay для подсветки и нестандартного курсора."""
+        self.recording_custom_cursor_overlay_ready = False
         try:
-            if not self.cursor_highlight_var.get():
-                return
+            visible = bool(getattr(self, "recording_cursor_visible", True))
+            size_percent = normalize_recording_cursor_size_percent(
+                getattr(self, "recording_cursor_size_percent", 100)
+            )
+            highlight = bool(getattr(self, "recording_cursor_highlight", False))
+            custom_cursor = visible and size_percent != 100
+            if not highlight and not custom_cursor:
+                self.stop_cursor_highlight_overlay()
+                return False
+
             self.stop_cursor_highlight_overlay()
-            size = max(20, min(240, int(self.cursor_highlight_size_var.get())))
+            highlight_size = max(
+                20,
+                min(200, int(getattr(self, "recording_cursor_highlight_size", 70))),
+            )
+            cursor_size = max(12, int(round(34 * size_percent / 100.0)))
+            margin = max(3, int(round(cursor_size * 0.08)))
+            ring_width = max(2, int(round(highlight_size * 0.08))) if highlight else 0
+            ring_radius = max(10, highlight_size // 2) if highlight else 0
+            left_extent = max(margin, ring_radius + ring_width + 2)
+            top_extent = max(margin, ring_radius + ring_width + 2)
+            right_extent = max(left_extent, cursor_size + margin)
+            bottom_extent = max(top_extent, cursor_size + margin)
+            overlay_width = left_extent + right_extent + 1
+            overlay_height = top_extent + bottom_extent + 1
+
             transparent = "#ff00ff"
             win = tk.Toplevel(self.root)
+            self._cursor_highlight_window = win
             win.overrideredirect(True)
             win.attributes("-topmost", True)
             win.configure(bg=transparent)
             try:
                 win.wm_attributes("-transparentcolor", transparent)
-            except Exception:
-                pass
-            canvas = tk.Canvas(win, width=size, height=size, bg=transparent, highlightthickness=0, bd=0)
-            canvas.pack(fill="both", expand=True)
-            pad = max(2, int(size * 0.08))
-            width = max(2, int(size * 0.08))
-            canvas.create_oval(pad, pad, size - pad, size - pad, outline="yellow", width=width)
-            win.geometry(f"{size}x{size}+0+0")
-            self.make_window_clickthrough(win)
-            self._cursor_highlight_window = win
+            except Exception as exc:
+                raise RuntimeError("Tk не поддерживает прозрачный cursor overlay") from exc
+            canvas = tk.Canvas(
+                win,
+                width=overlay_width,
+                height=overlay_height,
+                bg=transparent,
+                highlightthickness=0,
+                bd=0,
+            )
             self._cursor_highlight_canvas = canvas
+            canvas.pack(fill="both", expand=True)
+            hotspot_x = left_extent
+            hotspot_y = top_extent
+            if highlight:
+                canvas.create_oval(
+                    hotspot_x - ring_radius,
+                    hotspot_y - ring_radius,
+                    hotspot_x + ring_radius,
+                    hotspot_y + ring_radius,
+                    outline="yellow",
+                    width=ring_width,
+                )
+            if custom_cursor:
+                scale = cursor_size / 34.0
+                outline_points = ((1, 1), (1, 27), (8, 21), (13, 33), (19, 31), (14, 20), (25, 20))
+                fill_points = ((4, 5), (4, 21), (9, 16), (14, 29), (16, 28), (11, 16), (19, 16))
+
+                def scaled_points(points):
+                    result = []
+                    for point_x, point_y in points:
+                        result.extend((
+                            hotspot_x + point_x * scale,
+                            hotspot_y + point_y * scale,
+                        ))
+                    return result
+
+                canvas.create_polygon(
+                    *scaled_points(outline_points),
+                    fill="#111111",
+                    outline="#111111",
+                )
+                canvas.create_polygon(
+                    *scaled_points(fill_points),
+                    fill="#ffffff",
+                    outline="#ffffff",
+                )
+
+            position = self.get_cursor_position()
+            if position is None:
+                raise RuntimeError("Windows не вернула позицию курсора для overlay")
+            cursor_x, cursor_y = position
+            if not self.position_cursor_overlay_window(
+                win,
+                overlay_width,
+                overlay_height,
+                cursor_x - left_extent,
+                cursor_y - top_extent,
+            ):
+                raise RuntimeError("Не удалось позиционировать cursor overlay")
+            if not self.make_window_clickthrough(win):
+                raise RuntimeError("Не удалось включить click-through для cursor overlay")
+            self._cursor_overlay_offset_x = left_extent
+            self._cursor_overlay_offset_y = top_extent
+            self._cursor_overlay_width = overlay_width
+            self._cursor_overlay_height = overlay_height
+            self.recording_custom_cursor_overlay_ready = bool(custom_cursor)
             self._update_cursor_highlight_overlay()
+            return bool(custom_cursor)
         except Exception as exc:
+            self.stop_cursor_highlight_overlay()
             self.log_exception("start_cursor_highlight_overlay", exc)
+            return False
 
     def _update_cursor_highlight_overlay(self):
         try:
             win = self._cursor_highlight_window
-            if not win or not self.is_recording or self.is_finalizing:
+            if not win or not self.is_recording:
+                self._cursor_highlight_job = None
                 return
-            size = max(20, min(240, int(self.cursor_highlight_size_var.get())))
-            x, y = self.get_cursor_position()
-            win.geometry(f"{size}x{size}+{int(x - size / 2)}+{int(y - size / 2)}")
+            position = self.get_cursor_position()
+            if position is None:
+                raise RuntimeError("Windows не вернула позицию курсора")
+            cursor_x, cursor_y = position
+            if not self.position_cursor_overlay_window(
+                win,
+                self._cursor_overlay_width,
+                self._cursor_overlay_height,
+                cursor_x - self._cursor_overlay_offset_x,
+                cursor_y - self._cursor_overlay_offset_y,
+            ):
+                raise RuntimeError("Не удалось обновить позицию cursor overlay")
             win.attributes("-topmost", True)
             self._cursor_highlight_job = self.root.after(16, self._update_cursor_highlight_overlay)
         except Exception:
             try:
-                self._cursor_highlight_job = self.root.after(80, self._update_cursor_highlight_overlay)
+                if self._cursor_highlight_window is not None and self.is_recording:
+                    self._cursor_highlight_job = self.root.after(80, self._update_cursor_highlight_overlay)
+                else:
+                    self._cursor_highlight_job = None
             except Exception:
                 self._cursor_highlight_job = None
 
     def stop_cursor_highlight_overlay(self):
+        self.recording_custom_cursor_overlay_ready = False
         try:
             if self._cursor_highlight_job is not None:
                 try:

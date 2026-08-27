@@ -415,7 +415,7 @@ class CaptureCommandsMixin:
                 "-i",
                 self.build_ddagrab_source_expression(
                     capture_poll_fps,
-                    bool(self.cursor_visible_var.get()),
+                    self.should_draw_native_recording_cursor(),
                     output_idx,
                 ),
             ]
@@ -434,7 +434,7 @@ class CaptureCommandsMixin:
                 "-framerate",
                 fps,
                 "-draw_mouse",
-                "1" if self.cursor_visible_var.get() else "0",
+                "1" if self.should_draw_native_recording_cursor() else "0",
                 "-i",
                 "desktop",
             ]

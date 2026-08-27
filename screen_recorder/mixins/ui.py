@@ -247,14 +247,14 @@ class UiMixin:
 
         monitor_count = detect_monitor_count()
         if monitor_count > 1:
-            ttk.Label(grid, text="Монитор (ddagrab):").grid(row=8, column=0, sticky="w", pady=4)
+            ttk.Label(grid, text="Монитор (ddagrab):").grid(row=10, column=0, sticky="w", pady=4)
             ttk.Combobox(
                 grid,
                 textvariable=self.monitor_index_var,
                 values=[str(i + 1) for i in range(monitor_count)],
                 state="readonly",
                 width=6,
-            ).grid(row=8, column=1, sticky="w", pady=4)
+            ).grid(row=10, column=1, sticky="w", pady=4)
 
         ttk.Label(
             video_box,
@@ -264,10 +264,25 @@ class UiMixin:
         ).pack(anchor="w", padx=10, pady=(0, 8))
 
         ttk.Checkbutton(grid, text="Показывать курсор при записи", variable=self.cursor_visible_var).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 2))
-        ttk.Checkbutton(grid, text="Подсветка курсора", variable=self.cursor_highlight_var).grid(row=6, column=0, columnspan=3, sticky="w", pady=2)
-        ttk.Label(grid, text="Размер подсветки:").grid(row=7, column=0, sticky="w", pady=4)
-        ttk.Scale(grid, from_=20, to=200, variable=self.cursor_highlight_size_var, orient="horizontal").grid(row=7, column=1, sticky="ew", pady=4)
-        ttk.Label(grid, textvariable=self.cursor_highlight_size_var, width=4).grid(row=7, column=2, sticky="w", padx=(8, 0), pady=4)
+        ttk.Label(grid, text="Размер курсора в видео:").grid(row=6, column=0, sticky="w", pady=4)
+        ttk.Combobox(
+            grid,
+            textvariable=self.cursor_size_percent_var,
+            values=[str(value) for value in RECORDING_CURSOR_SIZE_PERCENT_OPTIONS],
+            state="readonly",
+            width=8,
+        ).grid(row=6, column=1, sticky="w", pady=4)
+        ttk.Label(grid, text="%").grid(row=6, column=2, sticky="w", padx=(8, 0), pady=4)
+        ttk.Label(
+            grid,
+            text="100% — системный курсор. Другой размер записывается как стандартная стрелка.",
+            foreground="#cfcfcf",
+            wraplength=520,
+        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Checkbutton(grid, text="Подсветка курсора", variable=self.cursor_highlight_var).grid(row=8, column=0, columnspan=3, sticky="w", pady=2)
+        ttk.Label(grid, text="Размер подсветки:").grid(row=9, column=0, sticky="w", pady=4)
+        ttk.Scale(grid, from_=20, to=200, variable=self.cursor_highlight_size_var, orient="horizontal").grid(row=9, column=1, sticky="ew", pady=4)
+        ttk.Label(grid, textvariable=self.cursor_highlight_size_var, width=4).grid(row=9, column=2, sticky="w", padx=(8, 0), pady=4)
 
         ttk.Label(
             video_box,

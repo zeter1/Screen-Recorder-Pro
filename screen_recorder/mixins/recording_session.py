@@ -189,9 +189,12 @@ class RecordingSessionMixin:
                     pass
                 return
 
+            self.refresh_recording_cursor_cache()
+            self.start_cursor_highlight_overlay()
             try:
                 self.start_new_segment()
             except Exception as exc:
+                self.stop_cursor_highlight_overlay()
                 self.log_exception("start_recording", exc)
                 try:
                     self.stop_recording_performance_sampler()
@@ -229,7 +232,7 @@ class RecordingSessionMixin:
             self.status_var.set("Идёт запись. Плавающая панель остаётся на экране; наведи на индикатор ●, чтобы открыть кнопки и карандаши.")
             self.schedule_auto_stop()
             self.start_keys_overlay()
-            self.start_cursor_highlight_overlay()
+            # Cursor overlay уже запущен до FFmpeg, чтобы он был в первом кадре.
         finally:
             self.is_starting = False
             try:
@@ -268,9 +271,11 @@ class RecordingSessionMixin:
         self.log_handle.write(f"segment_container={segment_path.suffix.lower()}\n")
         self.log_handle.write(f"DXCAM_AVAILABLE={DXCAM_AVAILABLE}\n")
         self.log_handle.write(f"selected_capture_method={self.capture_method_var.get()}\n")
-        self.log_handle.write(f"cursor_visible={self.cursor_visible_var.get()}\n")
-        self.log_handle.write(f"cursor_highlight={self.cursor_highlight_var.get()}\n")
-        self.log_handle.write(f"cursor_highlight_size={self.cursor_highlight_size_var.get()}\n")
+        self.log_handle.write(f"cursor_visible={self.recording_cursor_visible}\n")
+        self.log_handle.write(f"cursor_size_percent={self.recording_cursor_size_percent}\n")
+        self.log_handle.write(f"cursor_render_mode={self.get_recording_cursor_render_mode()}\n")
+        self.log_handle.write(f"cursor_highlight={self.recording_cursor_highlight}\n")
+        self.log_handle.write(f"cursor_highlight_size={self.recording_cursor_highlight_size}\n")
         self.log_handle.flush()
         self.diagnostic_log("recording_segment_start", {
             "recording_session_id": self.recording_session_id,

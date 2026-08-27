@@ -332,6 +332,10 @@ class ScreenRecorderProWin11(
         self.draw_enabled_var = tk.BooleanVar(value=True)
         self.floating_panel_size_var = tk.IntVar(value=normalize_floating_panel_size(self.settings.get("floating_panel_size", 34)))
         self.cursor_visible_var = tk.BooleanVar(value=bool(self.settings.get("cursor_visible", True)))
+        cursor_size_percent_value = normalize_recording_cursor_size_percent(
+            self.settings.get("cursor_size_percent", 100)
+        )
+        self.cursor_size_percent_var = tk.StringVar(value=str(cursor_size_percent_value))
         self.cursor_highlight_var = tk.BooleanVar(value=bool(self.settings.get("cursor_highlight", False)))
         try:
             cursor_size_value = int(self.settings.get("cursor_highlight_size", 70))
@@ -342,6 +346,7 @@ class ScreenRecorderProWin11(
         # Кэш параметров курсора для потока записи. Tk-переменные нельзя читать
         # из фонового DXcam-потока, особенно во время остановки из GUI-панели.
         self.recording_cursor_visible = bool(self.cursor_visible_var.get())
+        self.recording_cursor_size_percent = int(cursor_size_percent_value)
         self.recording_cursor_highlight = bool(self.cursor_highlight_var.get())
         self.recording_cursor_highlight_size = int(cursor_size_value)
         self._cursor_bitmap_cache = None
@@ -385,6 +390,11 @@ class ScreenRecorderProWin11(
         self._cursor_highlight_window = None
         self._cursor_highlight_canvas = None
         self._cursor_highlight_job = None
+        self._cursor_overlay_offset_x = 0
+        self._cursor_overlay_offset_y = 0
+        self._cursor_overlay_width = 1
+        self._cursor_overlay_height = 1
+        self.recording_custom_cursor_overlay_ready = False
         # Область — разовая: применяется к ОДНОЙ записи, запущенной кнопкой
         # «Область». Обычная «Запись» всегда пишет весь экран.
         self.capture_region = None       # активная область текущей записи (None = весь экран)

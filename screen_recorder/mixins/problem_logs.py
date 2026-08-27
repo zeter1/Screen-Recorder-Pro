@@ -1404,6 +1404,7 @@ class ProblemLogsMixin:
             "countdown_enabled": safe_get("countdown_enabled_var"),
             "show_keys_overlay": safe_get("show_keys_overlay_var"),
             "cursor_visible": safe_get("cursor_visible_var"),
+            "cursor_size_percent": safe_get("cursor_size_percent_var"),
             "cursor_highlight": safe_get("cursor_highlight_var"),
             "cursor_highlight_size": safe_get("cursor_highlight_size_var"),
             "open_folder_after_stop": safe_get("open_folder_after_stop_var"),

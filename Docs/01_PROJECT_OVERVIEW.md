@@ -35,8 +35,8 @@ NVIDIA GTX 1660 SUPER / NVENC
 В `screen_recorder/shared.py`:
 
 ```python
-APP_BUILD = "2026-08-16-audio-sync-diagnostics-v21"
-DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v17"
+APP_BUILD = "2026-08-24-recording-cursor-size-v24"
+DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v20"
 DXCAM_CAPTURE_ENABLED = False
 ```
 
@@ -102,6 +102,11 @@ recording_temp/
 `screenshot_arrow_color`, `screenshot_arrow_size` и глобальная позиция панели
 `screenshot_toolbar_x/y`. При загрузке значения нормализуются, а координаты
 ограничиваются текущим виртуальным рабочим столом.
+
+Размер курсора в записи хранится в `cursor_size_percent`. Значение `100`
+оставляет настоящий системный курсор FFmpeg. Для другого размера программа
+отключает native `draw_mouse` и захватывает собственную масштабированную
+стрелку из click-through overlay, не меняя глобальные настройки Windows.
 
 ## Основные зависимости
 
