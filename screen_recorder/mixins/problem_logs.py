@@ -416,6 +416,8 @@ class ProblemLogsMixin:
             self.session_audio_sync_path = None
             self.current_log_path = None
             self.last_debug_log_path = None
+            self._session_log_accepts_live_events = False
+            self._session_log_owner_id = None
             self.update_problem_logs_status_text()
             return True
         except Exception:
@@ -495,6 +497,8 @@ class ProblemLogsMixin:
     def create_recording_problem_log_folder(self):
         """Создаёт папку логов конкретной записи и базовые файлы для нейросети."""
         if not self.should_write_problem_logs():
+            self._session_log_accepts_live_events = False
+            self._session_log_owner_id = None
             self.current_session_log_dir = None
             self.session_summary_path = None
             self.session_events_path = None
@@ -542,6 +546,8 @@ class ProblemLogsMixin:
         self.session_clock_alignment_path = folder / "13_сводка_времени_и_дрейфа.json"
         self.session_timing_detail_path = folder / "14_детальный_тайминг_видео.json"
         self.session_audio_sync_path = folder / "15_синхронизация_системного_звука.json"
+        self._session_log_owner_id = str(self.recording_session_id or base_name)
+        self._session_log_accepts_live_events = True
         self._session_events_truncated = False
         self._session_ffmpeg_truncated = False
         self._session_errors_truncated = False
@@ -695,6 +701,9 @@ class ProblemLogsMixin:
   точная причина выбора находится в status события capture_region_selection_finished.
 - Не называй предположение доказанным фактом.
 - Низкий visual update FPS без технической корреляции считай наблюдением, а не доказанным рывком записи.
+- diagnostic_coverage.visual_motion_test.status=insufficient_continuous_motion означает, что плавность по содержимому NOT VERIFIED.
+- system_cpu_pressure.status=sustained_saturation анализируй вместе с bounded high_cpu_process_attribution_snapshots.
+- recording_problem_log_session_closed — граница live-событий; более поздние обычные события в этом 01-файле являются нарушением изоляции.
 - recovery_path_exercised=false означает, что обычная запись прошла, но переключение аудиоустройства в этой сессии не проверялось.
 - Не предлагай большой рефакторинг, если проблему можно исправить локально.
 - Если нужного участка исходников нет в ограниченном файле 11, укажи точный файл/функцию, которую надо запросить из архива программы.
@@ -841,7 +850,11 @@ class ProblemLogsMixin:
             if getattr(self, "_source_snapshot_written_for_error", False):
                 return getattr(self, "session_source_snapshot_path", None)
             path = getattr(self, "session_source_snapshot_path", None)
-            if not path or not self.should_write_problem_logs():
+            if (
+                not path
+                or not self.should_write_problem_logs()
+                or not getattr(self, "_session_log_accepts_live_events", False)
+            ):
                 return None
             self._source_snapshot_written_for_error = True
             write_modular_source_snapshot(path, max_bytes=300_000)
@@ -853,10 +866,44 @@ class ProblemLogsMixin:
         except Exception:
             return None
 
+    def close_recording_problem_log_session(self, recording_session_id=None, reason="completed"):
+        """Закрывает live-маршрут 01-файла, не мешая замороженному post-save context."""
+        try:
+            owner_id = getattr(self, "_session_log_owner_id", None)
+            expected_id = str(recording_session_id) if recording_session_id is not None else None
+            if expected_id and owner_id and expected_id != str(owner_id):
+                return False
+            if not getattr(self, "_session_log_accepts_live_events", False):
+                return False
+
+            closed_at = datetime.now().isoformat(timespec="milliseconds")
+            try:
+                self.problem_log_event(
+                    "recording_problem_log_session_closed",
+                    {
+                        "recording_session_id": owner_id,
+                        "reason": str(reason),
+                        "closed_at": closed_at,
+                        "note_for_ai": (
+                            "После этого события обычные события приложения больше не должны "
+                            "попадать в 01-файл этой записи. Post-save worker пишет только через "
+                            "замороженный context конкретной сессии."
+                        ),
+                    },
+                )
+            except Exception:
+                pass
+            self._session_log_accepts_live_events = False
+            return True
+        except Exception:
+            return False
+
     def problem_log_event(self, event, data=None, level="INFO"):
         """Компактный JSONL-журнал событий записи, удобный для анализа нейросетью."""
         try:
             if not self.should_write_problem_logs():
+                return
+            if not getattr(self, "_session_log_accepts_live_events", False):
                 return
             if not getattr(self, "session_events_path", None):
                 return
@@ -884,6 +931,8 @@ class ProblemLogsMixin:
         """Отдельный файл только с ошибками/трейсами, чтобы нейросеть быстро нашла проблему."""
         try:
             if not self.should_write_problem_logs():
+                return
+            if not getattr(self, "_session_log_accepts_live_events", False):
                 return
             if not getattr(self, "session_errors_path", None):
                 return
@@ -961,6 +1010,8 @@ class ProblemLogsMixin:
         """Отдельный компактный лог FFmpeg/FFprobe без повторов больших команд/проб."""
         try:
             if not self.should_write_problem_logs():
+                return
+            if not getattr(self, "_session_log_accepts_live_events", False):
                 return
             if not getattr(self, "session_ffmpeg_path", None):
                 return

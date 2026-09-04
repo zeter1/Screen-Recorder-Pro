@@ -251,6 +251,8 @@ class CaptureCommandsMixin:
             "settb=expr=1/1000000,"
             "setpts=RTCTIME-RTCSTART,"
             f"fps={fps_int}:round=near,"
+            # Бесконечный tpad мешает q/EOF дописать trailer. Недоступный
+            # desktop дополняется конечным стоп-кадром при финализации.
             f"settb=expr=1/{timescale},"
             "setpts=PTS-STARTPTS"
         )

@@ -22,6 +22,9 @@ class WasapiLoopbackWaveRecorder:
     AUDCLNT_E_DEVICE_INVALIDATED = 0x88890004
     RECONNECT_TIMEOUT_SECONDS = 10.0
     RECONNECT_INTERVAL_SECONDS = 0.25
+    WAV_RIFF_MAX_DATA_BYTES = 0xFFFFFFFF - 36
+    WAV_SAFE_DATA_BYTES = 3_500_000_000
+    SILENCE_WRITE_CHUNK_FRAMES = 65536
 
     def __init__(self, output_path, role="console", volume=1.0, log_callback=None):
         self.output_path = Path(output_path)
@@ -38,6 +41,7 @@ class WasapiLoopbackWaveRecorder:
         self.endpoint_invalidations = 0
         self.reconnect_attempts = 0
         self.reconnect_successes = 0
+        self.output_sample_rate = None
 
     def log(self, text):
         try:
@@ -98,17 +102,82 @@ class WasapiLoopbackWaveRecorder:
             return output_path
         return output_path.with_name(f"{output_path.stem}.reconnect-{index:03d}{output_path.suffix}")
 
-    @staticmethod
-    def _wav_has_frames(path):
+    @classmethod
+    def inspect_wav_file(cls, path):
+        wav_path = Path(path)
+        result = {
+            "path": str(wav_path),
+            "exists": wav_path.exists(),
+            "file_size_bytes": 0,
+            "declared_data_bytes": None,
+            "expected_standard_file_size_bytes": None,
+            "trailing_or_missing_bytes": None,
+            "frame_count": None,
+            "sample_frame_bytes": None,
+            "valid": False,
+            "reason": None,
+        }
+        if not result["exists"]:
+            result["reason"] = "file_missing"
+            return result
         try:
-            return Path(path).exists() and Path(path).stat().st_size > 44
-        except Exception:
-            return False
+            result["file_size_bytes"] = int(wav_path.stat().st_size)
+            with wave.open(str(wav_path), "rb") as wav_reader:
+                frame_count = int(wav_reader.getnframes())
+                sample_frame_bytes = int(wav_reader.getnchannels()) * int(wav_reader.getsampwidth())
+                declared_data_bytes = frame_count * sample_frame_bytes
+            expected_size = 44 + declared_data_bytes
+            trailing_or_missing = result["file_size_bytes"] - expected_size
+            result.update({
+                "declared_data_bytes": declared_data_bytes,
+                "expected_standard_file_size_bytes": expected_size,
+                "trailing_or_missing_bytes": trailing_or_missing,
+                "frame_count": frame_count,
+                "sample_frame_bytes": sample_frame_bytes,
+            })
+            if declared_data_bytes <= 0:
+                result["reason"] = "no_audio_frames"
+            elif declared_data_bytes > cls.WAV_SAFE_DATA_BYTES:
+                result["reason"] = "declared_data_exceeds_safe_riff_limit"
+            elif trailing_or_missing != 0:
+                result["reason"] = "wav_header_size_mismatch"
+            else:
+                result["valid"] = True
+                result["reason"] = "ok"
+        except Exception as exc:
+            result["reason"] = "wav_parse_failed"
+            result["error"] = repr(exc)
+        return result
+
+    @classmethod
+    def _wav_has_frames(cls, path):
+        return bool(cls.inspect_wav_file(path).get("valid"))
+
+    @classmethod
+    def _write_wav_pcm_with_limit(cls, wav_file, pcm):
+        if not pcm:
+            return
+        current_bytes = int(getattr(wav_file, "_datawritten", 0) or 0)
+        next_bytes = current_bytes + len(pcm)
+        if next_bytes > cls.WAV_SAFE_DATA_BYTES:
+            raise RuntimeError(
+                "CoreAudio WAV приблизился к пределу RIFF: "
+                f"{next_bytes} байт данных при безопасном лимите {cls.WAV_SAFE_DATA_BYTES}. "
+                "Сегмент должен быть закрыт и продолжен новым."
+            )
+        wav_file.writeframesraw(pcm)
 
     def _merge_wav_parts(self, part_paths):
         parts = [Path(path) for path in part_paths if self._wav_has_frames(path)]
         if not parts:
             raise RuntimeError("CoreAudio loopback не создал ни одного пригодного WAV-фрагмента.")
+        part_details = [self.inspect_wav_file(path) for path in parts]
+        total_data_bytes = sum(int(item.get("declared_data_bytes") or 0) for item in part_details)
+        if total_data_bytes > self.WAV_SAFE_DATA_BYTES:
+            raise RuntimeError(
+                "Объединённый CoreAudio WAV превысит безопасный предел RIFF: "
+                f"{total_data_bytes} байт данных."
+            )
         if len(parts) == 1:
             if parts[0] != self.output_path:
                 os.replace(str(parts[0]), str(self.output_path))
@@ -201,6 +270,9 @@ class WasapiLoopbackWaveRecorder:
                     )
                     if self._wav_has_frames(part_path):
                         part_paths.append(part_path)
+                    else:
+                        details = self.inspect_wav_file(part_path)
+                        raise RuntimeError(f"CoreAudio loopback создал некорректный WAV: {details}")
                     break
                 except _CoreAudioHRESULTError as exc:
                     now = time.perf_counter()
@@ -360,6 +432,7 @@ class WasapiLoopbackWaveRecorder:
             fmt = ctypes.cast(p_mix_format, ctypes.POINTER(WAVEFORMATEX)).contents
             channels = int(fmt.nChannels or 2)
             sample_rate = int(fmt.nSamplesPerSec or 48000)
+            self.output_sample_rate = sample_rate
             bits = int(fmt.wBitsPerSample or 32)
             block_align = int(fmt.nBlockAlign or max(1, channels * bits // 8))
             format_tag = int(fmt.wFormatTag)
@@ -466,8 +539,14 @@ class WasapiLoopbackWaveRecorder:
                         expected = int((time.perf_counter() - silence_start_perf) * sample_rate)
                         if expected > frames_written:
                             gap = expected - frames_written
-                            wav_file.writeframesraw(b"\x00" * gap * out_frame_bytes)
-                            frames_written = expected
+                            while gap > 0:
+                                chunk_frames = min(gap, self.SILENCE_WRITE_CHUNK_FRAMES)
+                                self._write_wav_pcm_with_limit(
+                                    wav_file,
+                                    b"\x00" * chunk_frames * out_frame_bytes,
+                                )
+                                frames_written += chunk_frames
+                                gap -= chunk_frames
                         time.sleep(0.005)
                         continue
                     while packet_frames.value and not self.stop_event.is_set():
@@ -495,7 +574,7 @@ class WasapiLoopbackWaveRecorder:
                                     raw = ctypes.string_at(data_ptr, frames * block_align)
                                     pcm = self._convert_to_pcm16_stereo(raw, frames, channels, bits, format_tag, subformat)
                                 if pcm:
-                                    wav_file.writeframesraw(pcm)
+                                    self._write_wav_pcm_with_limit(wav_file, pcm)
                                     frames_written += frames
                         finally:
                             release_hr = release_buffer(p_capture_client, num_frames)
@@ -512,11 +591,13 @@ class WasapiLoopbackWaveRecorder:
                 except Exception:
                     pass
         finally:
+            capture_exception_active = sys.exc_info()[0] is not None
+            close_error = None
             try:
                 if wav_file:
                     wav_file.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                close_error = exc
             try:
                 if p_mix_format and p_mix_format.value and ole32:
                     ole32.CoTaskMemFree(p_mix_format)
@@ -531,6 +612,8 @@ class WasapiLoopbackWaveRecorder:
                     ole32.CoUninitialize()
                 except Exception:
                     pass
+            if close_error is not None and not capture_exception_active:
+                raise RuntimeError(f"Не удалось корректно закрыть CoreAudio WAV: {close_error}") from close_error
 
     def _convert_to_pcm16_stereo(self, raw, frames, channels, bits, format_tag, subformat):
         if frames <= 0:

@@ -92,6 +92,8 @@ class ScreenRecorderProWin11(
         self.session_clock_alignment_path = None
         self.session_timing_detail_path = None
         self.session_audio_sync_path = None
+        self._session_log_accepts_live_events = False
+        self._session_log_owner_id = None
         self._session_events_truncated = False
         self._session_ffmpeg_truncated = False
         self._session_errors_truncated = False
@@ -165,10 +167,36 @@ class ScreenRecorderProWin11(
         self.segment_first_progress_out_time = None
         self.current_segment_media_seconds = 0.0
         self.current_segment_last_progress_perf = None
+        self.current_segment_last_video_frame_value = None
+        self.current_segment_last_video_frame_advance_perf = None
+        self.current_segment_last_video_frame_out_time_seconds = None
+        self.current_segment_video_stall_detected = False
+        self.recording_capture_recovery_attempts = 0
+        # stderr FFmpeg читается отдельным потоком: он только пишет исходный
+        # вывод в лог и кладёт неизменяемый сигнал в очередь. Решение о
+        # перезапуске и любые Tkinter-вызовы остаются в главном потоке.
+        self.recording_stderr_threads = []
+        self.recording_capture_signal_queue = queue.Queue(maxsize=32)
+        self.recording_process_generation = 0
+        self.current_capture_access_lost = None
+        self.current_capture_access_lost_wait_logged = False
+        self.capture_recovery_segments = {}
+        self.recording_segment_start_perfs = {}
+        self.recording_ffmpeg_args = []
+        self.automatic_segment_restart_thread = None
+        self.automatic_segment_restart_generation = 0
+        self.automatic_segment_restart_result_queue = queue.Queue(maxsize=8)
+        self.automatic_segment_restart_poll_job = None
         self.recording_performance_lock = threading.RLock()
         self.recording_performance_samples = []
         self.recording_performance_thread = None
         self.recording_performance_stop_event = threading.Event()
+        self._performance_cpu_measurement_count = 0
+        self._performance_high_cpu_consecutive = 0
+        self._performance_high_cpu_snapshot_count = 0
+        self._performance_high_cpu_last_snapshot_perf = 0.0
+        self._performance_process_cpu_handles = {}
+        self._performance_process_cpu_last_snapshot_perf = None
         self.last_video_timing_summary = None
         self.last_frame_content_analysis = None
         self.last_ai_smoothness_report = None

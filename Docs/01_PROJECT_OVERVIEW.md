@@ -35,8 +35,8 @@ NVIDIA GTX 1660 SUPER / NVENC
 В `screen_recorder/shared.py`:
 
 ```python
-APP_BUILD = "2026-08-24-recording-cursor-size-v24"
-DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v20"
+APP_BUILD = "2026-09-04-finite-capture-recovery-v26"
+DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v22"
 DXCAM_CAPTURE_ENABLED = False
 ```
 
@@ -49,8 +49,19 @@ DXCAM_CAPTURE_ENABLED = False
 - минимальный drift между реальными часами и медиатаймлайном;
 - отсутствие подтверждённой перегрузки CPU/GPU/NVENC;
 - нормальную синхронизацию аудио и видео.
+- live-watchdog читает доказанный `DXGI_ERROR_ACCESS_LOST` из дренируемого stderr, ждёт возврата `Default` desktop и перезапускает только затронутый сегмент;
+- подтверждённый DXGI-разрыв дополняется конечным стоп-кадром при сохранении, после штатного закрытия исходного файла; живой захват не содержит бесконечного `tpad`;
+- записанный звук сохраняется, но звук, не захваченный во время перезапуска источников, восстановить нельзя; результат сопровождается предупреждением;
+- CoreAudio-сегменты закрываются не позже 4 часов, а при высокой частоте дискретизации раньше, чтобы RIFF/WAV не превысил 32-битный предел;
+- очень короткие клипы не признаются повреждёнными только по нестабильному отношению frame count / duration.
 
 ## Точки запуска
+
+Проверки v26: синтетическая остановка FFmpeg с видео и с продолжающимся аудио,
+содержимое восстановленного интервала и склейка CPU H.264 (MP4/MKV), NVENC
+H.264/H.265 (MP4). Реальный переход Windows через `Ctrl+Alt+Delete`, GUI и
+длинная запись после этой правки остаются `NOT_VERIFIED`; тест описан в
+[`07_DEVELOPMENT_AND_TESTING.md`](07_DEVELOPMENT_AND_TESTING.md).
 
 ### Совместимый launcher
 

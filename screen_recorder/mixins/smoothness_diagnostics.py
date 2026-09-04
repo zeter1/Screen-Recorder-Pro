@@ -241,6 +241,16 @@ class SmoothnessDiagnosticsMixin:
                             except Exception:
                                 pass
 
+                        if frame is not None and frame > 0:
+                            previous_frame = self.current_segment_last_video_frame_value
+                            if previous_frame is None or int(frame) > int(previous_frame):
+                                self.current_segment_last_video_frame_value = int(frame)
+                                self.current_segment_last_video_frame_advance_perf = now_perf
+                                if out_time_seconds is not None:
+                                    self.current_segment_last_video_frame_out_time_seconds = max(
+                                        0.0,
+                                        float(out_time_seconds),
+                                    )
                     if frame is not None and frame > 0:
                         # `-progress` приходит периодически, поэтому момент чтения
                         # первой строки позже первого кадра. Оцениваем реальный
@@ -451,6 +461,104 @@ class SmoothnessDiagnosticsMixin:
         except Exception as exc:
             return {"available": False, "error": repr(exc)}
 
+    def _prime_cpu_process_attribution(self):
+        """Сбрасывает окно attribution; тяжёлый обход процессов во время старта не выполняется."""
+        self._performance_process_cpu_handles = {}
+        self._performance_process_cpu_last_snapshot_perf = time.perf_counter()
+
+    def _capture_high_cpu_process_attribution(
+        self,
+        system_cpu_percent,
+        consecutive_high_samples,
+        now_perf=None,
+    ):
+        """Редкий Windows PDH-снимок top CPU без чтения command line и без полного psutil-обхода."""
+        if os.name != "nt":
+            return {"status": "windows_pdh_unavailable_on_this_platform"}
+        query = None
+        capture_started = time.perf_counter()
+        try:
+            import win32pdh
+
+            query = win32pdh.OpenQuery()
+            add_counter = getattr(win32pdh, "AddEnglishCounter", win32pdh.AddCounter)
+            cpu_counter = add_counter(query, r"\Process(*)\% Processor Time")
+            pid_counter = add_counter(query, r"\Process(*)\ID Process")
+            win32pdh.CollectQueryData(query)
+            # PDH rate counter needs two samples. Wait runs only in the diagnostics
+            # worker after sustained overload; GUI and FFmpeg threads are not blocked.
+            stop_event = getattr(self, "recording_performance_stop_event", None)
+            if stop_event is not None:
+                stop_event.wait(0.25)
+            else:
+                time.sleep(0.25)
+            win32pdh.CollectQueryData(query)
+            cpu_values = dict(win32pdh.GetFormattedCounterArray(cpu_counter, win32pdh.PDH_FMT_DOUBLE))
+            pid_values = dict(win32pdh.GetFormattedCounterArray(pid_counter, win32pdh.PDH_FMT_LONG))
+            logical_cpu_count = int(psutil.cpu_count(logical=True) or 1) if PSUTIL_AVAILABLE else int(os.cpu_count() or 1)
+            process_rows = []
+            for instance_name, raw_cpu_percent in cpu_values.items():
+                try:
+                    if instance_name in {"_Total", "Idle"}:
+                        continue
+                    pid = int(pid_values.get(instance_name) or 0)
+                    if pid <= 0:
+                        continue
+                    raw_cpu_percent = max(0.0, float(raw_cpu_percent or 0.0))
+                    process_rows.append({
+                        "pid": pid,
+                        "name": str(instance_name)[:120],
+                        "cpu_percent_one_logical_cpu_basis": round(raw_cpu_percent, 3),
+                        "cpu_percent_of_machine_capacity": round(raw_cpu_percent / logical_cpu_count, 3),
+                    })
+                except Exception:
+                    continue
+            process_rows.sort(
+                key=lambda item: float(item.get("cpu_percent_one_logical_cpu_basis") or 0.0),
+                reverse=True,
+            )
+            top_processes = process_rows[:8]
+            if PSUTIL_AVAILABLE:
+                for item in top_processes:
+                    try:
+                        proc = psutil.Process(int(item["pid"]))
+                        item["rss_bytes"] = int(proc.memory_info().rss)
+                        item["status"] = str(proc.status())
+                    except Exception:
+                        item["rss_bytes"] = None
+                        item["status"] = "unavailable_process_exited_or_access_denied"
+            return {
+                "status": "ok",
+                "backend": "windows_pdh_wildcard_process_counters",
+                "captured_at": datetime.now().isoformat(timespec="milliseconds"),
+                "system_cpu_percent": round(float(system_cpu_percent), 3),
+                "consecutive_samples_at_or_above_95_percent": int(consecutive_high_samples),
+                "pdh_sampling_window_seconds": 0.25,
+                "collection_elapsed_seconds": round(time.perf_counter() - capture_started, 3),
+                "logical_cpu_count": logical_cpu_count,
+                "visible_process_count": len(process_rows),
+                "top_processes": top_processes,
+                "privacy": "Сохраняются только имя instance, PID, CPU, RSS и status; command line и пользовательские данные не читаются.",
+                "interpretation": (
+                    "cpu_percent_one_logical_cpu_basis может быть выше 100 для многопоточного процесса; "
+                    "для сопоставления с общей загрузкой используй cpu_percent_of_machine_capacity."
+                ),
+            }
+        except Exception as exc:
+            return {
+                "status": "collection_failed",
+                "backend": "windows_pdh_wildcard_process_counters",
+                "error": repr(exc),
+                "system_cpu_percent": system_cpu_percent,
+                "collection_elapsed_seconds": round(time.perf_counter() - capture_started, 3),
+            }
+        finally:
+            if query is not None:
+                try:
+                    win32pdh.CloseQuery(query)
+                except Exception:
+                    pass
+
     def collect_recording_performance_sample(self):
         now_perf = time.perf_counter()
         sample = {
@@ -468,10 +576,19 @@ class SmoothnessDiagnosticsMixin:
             "latest_ffmpeg_progress": dict(getattr(self, "recording_progress_latest", {}) or {}),
         }
         if PSUTIL_AVAILABLE:
+            cpu_measurement_index = int(getattr(self, "_performance_cpu_measurement_count", 0) or 0)
+            sample["system_cpu_measurement_warmup"] = cpu_measurement_index == 0
+            self._performance_cpu_measurement_count = cpu_measurement_index + 1
             try:
                 sample["system_cpu_percent"] = psutil.cpu_percent(None)
             except Exception:
                 sample["system_cpu_percent"] = None
+            try:
+                sample["system_cpu_per_core_percent"] = [
+                    float(value) for value in psutil.cpu_percent(None, percpu=True)
+                ]
+            except Exception:
+                sample["system_cpu_per_core_percent"] = None
             try:
                 vm = psutil.virtual_memory()
                 sample["memory"] = {
@@ -509,6 +626,38 @@ class SmoothnessDiagnosticsMixin:
                 pass
             sample["python_process"] = self._process_metrics(os.getpid())
             sample["ffmpeg_process"] = self._process_metrics(self.recording_ffmpeg_pid)
+            try:
+                cpu_value = sample.get("system_cpu_percent")
+                if sample.get("system_cpu_measurement_warmup") or cpu_value is None:
+                    self._performance_high_cpu_consecutive = 0
+                elif float(cpu_value) >= 95.0:
+                    self._performance_high_cpu_consecutive = int(
+                        getattr(self, "_performance_high_cpu_consecutive", 0) or 0
+                    ) + 1
+                else:
+                    self._performance_high_cpu_consecutive = 0
+                consecutive = int(getattr(self, "_performance_high_cpu_consecutive", 0) or 0)
+                snapshot_count = int(getattr(self, "_performance_high_cpu_snapshot_count", 0) or 0)
+                last_snapshot_perf = float(
+                    getattr(self, "_performance_high_cpu_last_snapshot_perf", 0.0) or 0.0
+                )
+                if (
+                    consecutive >= 5
+                    and snapshot_count < 3
+                    and now_perf - last_snapshot_perf >= 20.0
+                ):
+                    sample["high_cpu_process_attribution"] = self._capture_high_cpu_process_attribution(
+                        cpu_value,
+                        consecutive,
+                        now_perf=now_perf,
+                    )
+                    self._performance_high_cpu_snapshot_count = snapshot_count + 1
+                    self._performance_high_cpu_last_snapshot_perf = now_perf
+            except Exception as exc:
+                sample["high_cpu_process_attribution"] = {
+                    "status": "collection_failed",
+                    "error": repr(exc),
+                }
         else:
             sample["psutil_available"] = False
 
@@ -540,6 +689,13 @@ class SmoothnessDiagnosticsMixin:
         def worker():
             detailed_until = 0.0
             try:
+                if PSUTIL_AVAILABLE:
+                    try:
+                        psutil.cpu_percent(None)
+                        psutil.cpu_percent(None, percpu=True)
+                    except Exception:
+                        pass
+                    self._prime_cpu_process_attribution()
                 while not self.recording_performance_stop_event.is_set():
                     started = time.perf_counter()
                     sample = self.collect_recording_performance_sample()
@@ -886,6 +1042,93 @@ class SmoothnessDiagnosticsMixin:
             ),
         }
 
+    @staticmethod
+    def summarize_resource_pressure(values, threshold=95.0):
+        """Отличает единичный пик от устойчивой перегрузки по последовательным samples."""
+        numeric_values = []
+        for value in values or []:
+            try:
+                numeric_values.append(float(value))
+            except Exception:
+                continue
+        if not numeric_values:
+            return {"status": "no_samples", "threshold_percent": float(threshold), "sample_count": 0}
+        high_flags = [value >= float(threshold) for value in numeric_values]
+        high_count = sum(1 for flag in high_flags if flag)
+        longest_run = 0
+        current_run = 0
+        for flag in high_flags:
+            if flag:
+                current_run += 1
+                longest_run = max(longest_run, current_run)
+            else:
+                current_run = 0
+        high_percent = 100.0 * high_count / len(numeric_values)
+        if high_count >= 3 and (high_percent >= 50.0 or longest_run >= 5):
+            status = "sustained_saturation"
+        elif high_count:
+            status = "brief_or_intermittent_peak"
+        else:
+            status = "normal"
+        return {
+            "status": status,
+            "threshold_percent": float(threshold),
+            "sample_count": len(numeric_values),
+            "samples_at_or_above_threshold": high_count,
+            "sample_percent_at_or_above_threshold": round(high_percent, 3),
+            "longest_consecutive_run_samples": longest_run,
+            "minimum_percent": min(numeric_values),
+            "maximum_percent": max(numeric_values),
+            "median_percent": statistics.median(numeric_values),
+        }
+
+    @staticmethod
+    def summarize_visual_diagnostic_coverage(frame_content_analysis):
+        """Показывает, достаточно ли движения в тесте для вывода о визуальной плавности."""
+        analysis = frame_content_analysis or {}
+        cadence = analysis.get("moving_content_cadence_analysis") or {}
+        analysis_status = str(analysis.get("status") or "unknown")
+        try:
+            analyzed_frames = int(analysis.get("analyzed_frame_count") or 0)
+        except Exception:
+            analyzed_frames = 0
+        try:
+            moving_windows = int(cadence.get("moving_window_count") or 0)
+        except Exception:
+            moving_windows = 0
+        if analysis_status != "ok":
+            status = "visual_analysis_unavailable"
+            recommendation = "Проверить status/error анализа 09 и повторить тест после устранения причины."
+            can_assess = False
+        elif analyzed_frames < 2:
+            status = "insufficient_frames"
+            recommendation = "Записать более длинный ролик, чтобы анализ получил достаточно кадров."
+            can_assess = False
+        elif moving_windows == 0:
+            status = "insufficient_continuous_motion"
+            recommendation = (
+                "Для проверки плавности записать 30–60 секунд непрерывной прокрутки или движения, "
+                "не закрывая и не останавливая движение порциями."
+            )
+            can_assess = False
+        elif moving_windows < 3:
+            status = "limited_motion_evidence"
+            recommendation = "Повторить тест с более длинным непрерывным движением для уверенного вывода."
+            can_assess = False
+        else:
+            status = "motion_evidence_available"
+            recommendation = "Сопоставить moving windows с 07/08 и ручным просмотром файла."
+            can_assess = True
+        return {
+            "status": status,
+            "analysis_status": analysis_status,
+            "analyzed_frame_count": analyzed_frames,
+            "moving_window_count": moving_windows,
+            "can_assess_visual_smoothness": can_assess,
+            "manual_motion_test_recommended": not can_assess,
+            "recommendation": recommendation,
+        }
+
     def summarize_performance_samples(self):
         with self.recording_performance_lock:
             samples = list(self.recording_performance_samples)
@@ -937,7 +1180,29 @@ class SmoothnessDiagnosticsMixin:
                     pass
             return {"value": best_value, "sample": best} if best is not None else None
 
-        cpu = nested_values(["system_cpu_percent"])
+        cpu = []
+        cpu_warmup_samples_excluded = 0
+        per_core_peak_percent = []
+        for sample in samples:
+            if sample.get("system_cpu_measurement_warmup"):
+                cpu_warmup_samples_excluded += 1
+                continue
+            try:
+                value = sample.get("system_cpu_percent")
+                if value is not None:
+                    cpu.append(float(value))
+            except Exception:
+                pass
+            try:
+                per_core = list(sample.get("system_cpu_per_core_percent") or [])
+                while len(per_core_peak_percent) < len(per_core):
+                    per_core_peak_percent.append(None)
+                for index, value in enumerate(per_core):
+                    value = float(value)
+                    current = per_core_peak_percent[index]
+                    per_core_peak_percent[index] = value if current is None else max(current, value)
+            except Exception:
+                pass
         ram = nested_values(["memory", "percent"])
         swap_percent = nested_values(["swap", "percent"])
         swap_used = nested_values(["swap", "used_bytes"])
@@ -973,6 +1238,7 @@ class SmoothnessDiagnosticsMixin:
             except Exception:
                 pass
 
+        disk_read_rates = []
         disk_write_rates = []
         ffmpeg_write_rates = []
         previous = None
@@ -984,6 +1250,7 @@ class SmoothnessDiagnosticsMixin:
                     dt = 0.0
                 if dt > 0:
                     for path, target in (
+                        (["disk_io_total", "read_bytes"], disk_read_rates),
                         (["disk_io_total", "write_bytes"], disk_write_rates),
                         (["ffmpeg_process", "write_bytes_total"], ffmpeg_write_rates),
                     ):
@@ -1002,8 +1269,15 @@ class SmoothnessDiagnosticsMixin:
                             pass
             previous = sample
 
+        peak_disk_read_rate = max(disk_read_rates, key=lambda x: x["bytes_per_second"]) if disk_read_rates else None
         peak_disk_rate = max(disk_write_rates, key=lambda x: x["bytes_per_second"]) if disk_write_rates else None
         peak_ffmpeg_rate = max(ffmpeg_write_rates, key=lambda x: x["bytes_per_second"]) if ffmpeg_write_rates else None
+        cpu_pressure = self.summarize_resource_pressure(cpu, threshold=95.0)
+        high_cpu_attribution_snapshots = [
+            sample.get("high_cpu_process_attribution")
+            for sample in samples
+            if isinstance(sample.get("high_cpu_process_attribution"), dict)
+        ][:3]
         swap_in_delta = None
         swap_out_delta = None
         try:
@@ -1020,7 +1294,11 @@ class SmoothnessDiagnosticsMixin:
         return {
             "sample_count": len(samples),
             "sampling_interval_strategy": "1s during first 10s/anomalies, 3s during steady recording",
+            "cpu_measurement_warmup_samples_excluded": cpu_warmup_samples_excluded,
             "system_cpu_percent": stats(cpu),
+            "system_cpu_pressure": cpu_pressure,
+            "system_cpu_per_core_peak_percent": per_core_peak_percent,
+            "high_cpu_process_attribution_snapshots": high_cpu_attribution_snapshots,
             "memory_percent": stats(ram),
             "swap_percent": stats(swap_percent),
             "swap_used_bytes": stats(swap_used),
@@ -1033,12 +1311,16 @@ class SmoothnessDiagnosticsMixin:
             "nvidia_encoder_util_percent": stats(encoder_util),
             "nvidia_memory_used_mb": stats(gpu_mem),
             "minimum_output_disk_free_bytes": min(free_disk) if free_disk else None,
+            "system_disk_read_bytes_per_second": stats([item["bytes_per_second"] for item in disk_read_rates]),
+            "system_disk_write_bytes_per_second": stats([item["bytes_per_second"] for item in disk_write_rates]),
+            "ffmpeg_write_bytes_per_second": stats([item["bytes_per_second"] for item in ffmpeg_write_rates]),
             "peak_system_cpu_sample": peak_sample(["system_cpu_percent"]),
             "peak_memory_sample": peak_sample(["memory", "percent"]),
             "peak_swap_sample": peak_sample(["swap", "percent"]),
             "peak_ffmpeg_cpu_sample": peak_sample(["ffmpeg_process", "cpu_percent"]),
             "peak_nvidia_gpu_sample": peak_gpu_sample,
             "peak_nvidia_encoder_sample": peak_encoder_sample,
+            "peak_system_disk_read_rate": peak_disk_read_rate,
             "peak_system_disk_write_rate": peak_disk_rate,
             "peak_ffmpeg_write_rate": peak_ffmpeg_rate,
             "first_sample": samples[0],
@@ -1937,12 +2219,14 @@ class SmoothnessDiagnosticsMixin:
         swap_in_delta = int((performance_summary or {}).get("swap_in_bytes_during_recording") or 0)
         swap_out_delta = int((performance_summary or {}).get("swap_out_bytes_during_recording") or 0)
         cpu_max = self._summary_stat_max(performance_summary, "system_cpu_percent")
+        cpu_pressure = (performance_summary or {}).get("system_cpu_pressure") or {}
         gpu_max = self._summary_stat_max(performance_summary, "nvidia_gpu_util_percent")
         encoder_max = self._summary_stat_max(performance_summary, "nvidia_encoder_util_percent")
 
         cadence_analysis = (
             (frame_content_analysis or {}).get("moving_content_cadence_analysis") or {}
         )
+        visual_coverage = self.summarize_visual_diagnostic_coverage(frame_content_analysis)
         low_cadence_count = int(cadence_analysis.get("low_cadence_window_count") or 0)
         strong_low_cadence_count = int(
             cadence_analysis.get("strong_continuous_low_cadence_window_count") or 0
@@ -2020,6 +2304,11 @@ class SmoothnessDiagnosticsMixin:
                 f"В содержимом кадров найдено {len(candidates)} статичных интервал(ов) между движением. "
                 "Они не считаются ошибкой без технического совпадения или просмотра видео."
             )
+        elif not visual_coverage.get("can_assess_visual_smoothness"):
+            observations.append(
+                "Visual-анализ не получил достаточно непрерывного движения для проверки плавности. "
+                + str(visual_coverage.get("recommendation") or "Нужен ручной тест движения.")
+            )
         else:
             positives.append("Анализ содержимого не нашёл статичных интервалов, окружённых движением.")
 
@@ -2048,8 +2337,21 @@ class SmoothnessDiagnosticsMixin:
             observations.append(
                 f"Файл подкачки занят максимум на {swap_max:.1f}%, но движения данных подкачки во время записи не зафиксировано."
             )
-        if cpu_max is not None and cpu_max >= 95:
-            warnings.append(f"Пиковая загрузка CPU достигала {cpu_max:.1f}%.")
+        cpu_pressure_status = str(cpu_pressure.get("status") or "")
+        if cpu_pressure_status == "sustained_saturation":
+            cpu_median = cpu_pressure.get("median_percent")
+            high_samples = cpu_pressure.get("samples_at_or_above_threshold")
+            total_samples = cpu_pressure.get("sample_count")
+            attribution_count = len(list(
+                (performance_summary or {}).get("high_cpu_process_attribution_snapshots") or []
+            ))
+            warnings.append(
+                "CPU был устойчиво перегружен: "
+                f"median={float(cpu_median):.1f}%, samples>=95%={high_samples}/{total_samples}. "
+                f"Снимков top-process: {attribution_count}; искать источник в performance.high_cpu_process_attribution_snapshots."
+            )
+        elif cpu_max is not None and cpu_max >= 95:
+            warnings.append(f"Зафиксирован краткий или прерывистый пик CPU до {cpu_max:.1f}%.")
         if gpu_max is not None and gpu_max >= 95:
             warnings.append(f"Пиковая загрузка GPU достигала {gpu_max:.1f}%.")
         if encoder_max is not None and encoder_max >= 95:
@@ -2069,6 +2371,10 @@ class SmoothnessDiagnosticsMixin:
             "observations_not_proven_problems": observations,
             "warnings": warnings,
             "problems": problems,
+            "diagnostic_coverage": {
+                "visual_motion_test": visual_coverage,
+                "system_cpu_pressure": cpu_pressure,
+            },
             "recording_pipeline_changed_by_this_diagnostics_update": False,
             "recording_pipeline_change": (
                 "Нет. В этой версии изменены только диагностика, фоновые служебные процессы "
@@ -2098,12 +2404,15 @@ class SmoothnessDiagnosticsMixin:
     def _compact_performance_summary(summary):
         summary = summary or {}
         keys = (
-            "sample_count", "sampling_interval_strategy", "sampling_interval_target_seconds", "system_cpu_percent",
+            "sample_count", "sampling_interval_strategy", "sampling_interval_target_seconds",
+            "cpu_measurement_warmup_samples_excluded", "system_cpu_percent", "system_cpu_pressure",
+            "system_cpu_per_core_peak_percent", "high_cpu_process_attribution_snapshots",
             "memory_percent", "swap_percent", "swap_used_bytes",
             "swap_in_bytes_during_recording", "swap_out_bytes_during_recording",
             "python_cpu_percent", "ffmpeg_cpu_percent", "ffmpeg_rss_bytes",
             "nvidia_gpu_util_percent", "nvidia_encoder_util_percent", "nvidia_memory_used_mb",
-            "minimum_output_disk_free_bytes",
+            "minimum_output_disk_free_bytes", "system_disk_read_bytes_per_second",
+            "system_disk_write_bytes_per_second", "ffmpeg_write_bytes_per_second",
         )
         return {key: summary.get(key) for key in keys if key in summary}
 
@@ -2357,6 +2666,7 @@ class SmoothnessDiagnosticsMixin:
         )
 
         cadence = (frame_content_analysis or {}).get("moving_content_cadence_analysis") or {}
+        visual_coverage = self.summarize_visual_diagnostic_coverage(frame_content_analysis)
         frame_brief = {
             "status": (frame_content_analysis or {}).get("status"),
             "analyzed_frame_count": (frame_content_analysis or {}).get("analyzed_frame_count"),
@@ -2371,6 +2681,7 @@ class SmoothnessDiagnosticsMixin:
                 "strong_continuous_low_cadence_window_count": cadence.get("strong_continuous_low_cadence_window_count"),
                 "bursty_or_stepwise_low_cadence_window_count": cadence.get("bursty_or_stepwise_low_cadence_window_count"),
                 "diagnostic_severity": cadence.get("diagnostic_severity"),
+                "diagnostic_coverage": visual_coverage,
                 "rule": cadence.get("rule"),
                 "lowest_cadence_moving_windows": list(cadence.get("lowest_cadence_moving_windows") or [])[:10],
             },
@@ -2391,6 +2702,7 @@ class SmoothnessDiagnosticsMixin:
                 "recorded_wall_seconds": context.get("recorded_wall_seconds"),
             },
             "automatic_smoothness_verdict": automatic_verdict,
+            "diagnostic_coverage": automatic_verdict.get("diagnostic_coverage"),
             "timing": self._compact_timing_summary(timing_summary),
             "clock_alignment": {
                 "status": clock_alignment.get("status"),
@@ -2415,6 +2727,8 @@ class SmoothnessDiagnosticsMixin:
                 "Не считать статичную сцену техническим рывком без движения и корреляции.",
                 "Low cadence понижает статус только при непрерывном движении и технической корреляции.",
                 "Сопоставлять кандидаты с 07/08 и техническими счетчиками до вывода о причине.",
+                "Если visual_motion_test.status недостаточен, плавность по содержимому NOT VERIFIED.",
+                "Устойчивую CPU-перегрузку связывать с bounded top-process snapshots, а не только с одним peak.",
             ],
         }
         try:
@@ -2451,6 +2765,10 @@ class SmoothnessDiagnosticsMixin:
                     "requested_fps": context.get("requested_fps"),
                     "target_fps": context.get("effective_fps"),
                     "automatic_status": automatic_verdict.get("status"),
+                    "visual_motion_test_status": visual_coverage.get("status"),
+                    "system_cpu_pressure_status": (
+                        ((automatic_verdict.get("diagnostic_coverage") or {}).get("system_cpu_pressure") or {}).get("status")
+                    ),
                     "timing_status": ((timing_summary.get("timing_health") or {}).get("status")),
                     "clock_alignment_status": clock_alignment.get("status"),
                     "ffmpeg_dup": progress_summary.get("total_dup_frames_across_segments"),
@@ -2500,6 +2818,7 @@ class SmoothnessDiagnosticsMixin:
         })
 
         def worker():
+            close_reason = "post_save_diagnostics_completed"
             try:
                 frame_analysis = self.analyze_visual_frame_cadence(
                     context.get("output_path"),
@@ -2511,6 +2830,7 @@ class SmoothnessDiagnosticsMixin:
                     update_shared_state=False,
                 )
                 if cancel_event.is_set() or (frame_analysis or {}).get("status") == "cancelled":
+                    close_reason = "post_save_diagnostics_cancelled"
                     self._append_post_context_event(context, "post_save_diagnostics_cancelled", {
                         "reason": "new_recording_or_application_exit",
                     })
@@ -2521,11 +2841,16 @@ class SmoothnessDiagnosticsMixin:
                     "candidate_count": len(list((frame_analysis or {}).get("suspected_freeze_candidates") or [])),
                 })
             except Exception as exc:
+                close_reason = "post_save_diagnostics_failed"
                 self._append_post_context_event(context, "post_save_diagnostics_failed", {
                     "error": repr(exc),
                     "traceback": traceback.format_exc(),
                 }, level="WARN")
             finally:
+                self.close_recording_problem_log_session(
+                    recording_session_id=context.get("recording_session_id"),
+                    reason=close_reason,
+                )
                 if self.post_diagnostics_cancel_event is cancel_event:
                     self.post_diagnostics_running = False
 
@@ -2578,7 +2903,11 @@ class SmoothnessDiagnosticsMixin:
                 "ai_target": "ChatGPT 5.6 Thinking / SOL",
                 "app_build": APP_BUILD,
                 "video_timing_strategy": {
-                    "ddagrab": "poll at up to 2x output FPS + arrival-wallclock setpts + single fps filter + fps_mode=passthrough",
+                    "ddagrab": (
+                        "poll at up to 2x output FPS + arrival-wallclock setpts + "
+                        "single fps filter + finite offline stop-frame on proven access loss + "
+                        "fps_mode=passthrough"
+                    ),
                     "gdigrab": "single fps filter using source PTS + settb + setpts=PTS-STARTPTS + fps_mode=passthrough",
                     "goal": "preserve real wall-clock duration while producing one monotonic CFR timeline",
                     "forbidden_regression": "setpts=N*ticks without a preceding source-clock fps normalizer",

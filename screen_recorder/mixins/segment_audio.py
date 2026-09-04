@@ -14,6 +14,27 @@ class SegmentAudioMixin:
         return video_seconds > 0.0 and loopback_seconds + tolerance < video_seconds
 
     @staticmethod
+    def is_segment_video_capture_truncated(video_duration, audio_duration, tolerance_seconds=10.0):
+        try:
+            video_seconds = max(0.0, float(video_duration))
+            audio_seconds = max(0.0, float(audio_duration))
+            tolerance = max(0.0, float(tolerance_seconds))
+        except Exception:
+            return False
+        return video_seconds > 0.0 and audio_seconds > video_seconds + tolerance
+
+    @staticmethod
+    def calculate_python_loopback_mix_timeout(video_duration, loopback_duration):
+        durations = []
+        for value in (video_duration, loopback_duration):
+            try:
+                durations.append(max(0.0, float(value)))
+            except Exception:
+                pass
+        longest = max(durations or [0.0])
+        return int(min(1800.0, max(180.0, 120.0 + longest / 20.0)))
+
+    @staticmethod
     def build_python_loopback_sync_plan(loopback_start_perf, video_start_perf, ignore_below_seconds=0.02):
         """Строит однозначный план выравнивания WAV относительно первого видеокадра."""
         try:
@@ -298,6 +319,24 @@ class SegmentAudioMixin:
             recorder_error = getattr(recorder, "error", None)
             if recorder_error is not None and stop_error is None:
                 stop_error = recorder_error
+            try:
+                wav_validation = recorder.inspect_wav_file(wav_path) if wav_path else {
+                    "valid": False,
+                    "reason": "wav_path_missing",
+                }
+            except Exception as exc:
+                wav_validation = {
+                    "valid": False,
+                    "reason": "wav_validation_failed",
+                    "error": repr(exc),
+                }
+            if not wav_validation.get("valid"):
+                if stop_error is None:
+                    stop_error = RuntimeError(
+                        "CoreAudio loopback создал некорректный WAV: "
+                        f"{wav_validation.get('reason')}"
+                    )
+                finished = False
             video_start_perf = getattr(self, "segment_capture_started_perf", None)
             sync_plan = self.build_python_loopback_sync_plan(
                 getattr(recorder, "capture_start_perf", None),
@@ -321,6 +360,7 @@ class SegmentAudioMixin:
                     "recovery_path_exercised": bool(getattr(recorder, "reconnect_attempts", 0)),
                     "stop_error": repr(stop_error) if stop_error else None,
                 })
+                metadata["wav_validation"] = wav_validation
             try:
                 size = Path(wav_path).stat().st_size if wav_path and Path(wav_path).exists() else 0
                 if metadata is not None:
@@ -356,6 +396,7 @@ class SegmentAudioMixin:
                     "reconnect_attempts": int(getattr(recorder, "reconnect_attempts", 0) or 0),
                     "reconnect_successes": int(getattr(recorder, "reconnect_successes", 0) or 0),
                     "recovery_path_exercised": bool(getattr(recorder, "reconnect_attempts", 0)),
+                    "wav_validation": wav_validation,
                 }, level="ERROR" if stop_error else "INFO")
                 self.write_python_loopback_audio_sync_report()
             except Exception:
@@ -470,6 +511,7 @@ class SegmentAudioMixin:
         })
         sync_plan = dict(metadata.get("sync_plan") or self.build_python_loopback_sync_plan(None, None))
         loopback_filter = self.build_python_loopback_audio_filter(sync_plan)
+        mix_timeout_seconds = self.calculate_python_loopback_mix_timeout(None, None)
 
         # Сохраняем длительности ДО смешивания. В прошлых логах звук был длиннее
         # ускоренного видеопотока, а -shortest скрывал это, обрезая конец аудио.
@@ -491,6 +533,46 @@ class SegmentAudioMixin:
                 if source_loopback_duration is not None and video_duration_before is not None
                 else None
             )
+            source_audio_duration = source_video_timing.get("audio_duration")
+            mix_timeout_seconds = self.calculate_python_loopback_mix_timeout(
+                video_duration_before,
+                source_loopback_duration,
+            )
+            truncated_sources = []
+            if self.is_segment_video_capture_truncated(video_duration_before, source_audio_duration):
+                truncated_sources.append("segment_audio")
+            if self.is_segment_video_capture_truncated(video_duration_before, source_loopback_duration):
+                truncated_sources.append("coreaudio_loopback")
+            if truncated_sources:
+                failure_details = {
+                    "segment_path": str(segment_path),
+                    "wav_path": str(wav_path),
+                    "video_duration_seconds": video_duration_before,
+                    "segment_audio_duration_seconds": source_audio_duration,
+                    "loopback_duration_seconds": source_loopback_duration,
+                    "truncated_sources": truncated_sources,
+                    "tolerance_seconds": 10.0,
+                }
+                metadata.update({
+                    "status": "incomplete",
+                    "video_capture_truncated": True,
+                    "video_capture_truncation_details": failure_details,
+                })
+                self.problem_log_event(
+                    "video_capture_truncated_before_audio_mix",
+                    failure_details,
+                    level="ERROR",
+                )
+                self.append_problem_error(
+                    "video_capture_truncated_before_audio_mix",
+                    "Видеопоток сегмента завершился значительно раньше аудио; "
+                    "смешивание остановлено, чтобы не скрывать потерянную часть записи.",
+                )
+                raise RuntimeError(
+                    "Видеозахват сегмента оборвался раньше аудио: "
+                    f"video={float(video_duration_before):.3f} с, "
+                    f"audio={max(float(value) for value in (source_audio_duration, source_loopback_duration) if value is not None):.3f} с."
+                )
             trim_seconds = max(0.0, float(sync_plan.get("trim_loopback_start_seconds") or 0.0))
             delay_seconds = max(0.0, float(sync_plan.get("delay_loopback_start_seconds") or 0.0))
             if source_loopback_duration is not None and trim_seconds >= max(0.0, float(source_loopback_duration) - 0.25):
@@ -518,6 +600,7 @@ class SegmentAudioMixin:
                 "source_audio_minus_video_seconds": duration_difference_before,
                 "effective_loopback_timeline_duration_seconds": effective_loopback_timeline_duration,
                 "ffmpeg_loopback_filter": loopback_filter,
+                "mix_timeout_seconds": mix_timeout_seconds,
             })
             self.problem_log_event("python_loopback_mix_timing_before", {
                 "segment_path": segment_path,
@@ -528,6 +611,7 @@ class SegmentAudioMixin:
                 "effective_loopback_timeline_duration_seconds": effective_loopback_timeline_duration,
                 "sync_plan": sync_plan,
                 "ffmpeg_loopback_filter": loopback_filter,
+                "mix_timeout_seconds": mix_timeout_seconds,
                 "has_segment_audio": has_segment_audio,
                 "mix_policy": (
                     "loopback is trimmed/delayed against the first-real-video-frame monotonic anchor, "
@@ -613,7 +697,7 @@ class SegmentAudioMixin:
             text=True,
             encoding="utf-8",
             errors="ignore",
-            timeout=180,
+            timeout=mix_timeout_seconds,
             creationflags=self.creation_flags(),
         )
         if result.returncode != 0:

@@ -84,8 +84,8 @@ except Exception:
 DXCAM_CAPTURE_ENABLED = False
 
 APP_NAME = "ScreenRecorderProWin11"
-APP_BUILD = "2026-08-24-recording-cursor-size-v24"
-DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v20"
+APP_BUILD = "2026-09-04-finite-capture-recovery-v26"
+DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v22"
 PROBLEM_LOGS_FOLDER_NAME = "Логи проблем"
 NO_AUDIO = "Не записывать"
 MIC_AUDIO_DEFAULT = "Микрофон (по умолчанию Windows)"

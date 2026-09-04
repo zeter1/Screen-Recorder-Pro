@@ -2,6 +2,18 @@ from ..shared import *
 
 
 class TimingMixin:
+    @staticmethod
+    def is_effective_fps_validation_applicable(video_duration, frame_count, target_fps):
+        try:
+            duration_seconds = max(0.0, float(video_duration))
+            frames = max(0.0, float(frame_count))
+            fps = max(0.0, float(target_fps))
+        except Exception:
+            return False
+        if duration_seconds < 2.0 or fps <= 0.0:
+            return False
+        return frames >= max(2.0, fps * 1.5)
+
     def scan_recording_log_for_timing_warnings(self):
         """Ищет проблемы PTS/DTS во всех логах записи и в progress JSONL.
 
@@ -497,8 +509,16 @@ class TimingMixin:
                 health_warnings.append("many_output_cfr_duplicates")
             if output_drop > cadence_limit:
                 health_warnings.append("many_output_cfr_drops")
+            fps_validation_applicable = self.is_effective_fps_validation_applicable(
+                video_duration,
+                frame_count,
+                target_fps,
+            )
             if fps_error_percent is not None and fps_error_percent > 3.0:
-                health_errors.append("effective_fps_differs_from_target")
+                if fps_validation_applicable:
+                    health_errors.append("effective_fps_differs_from_target")
+                else:
+                    health_warnings.append("short_recording_effective_fps_inconclusive")
             if non_positive_intervals:
                 health_errors.append("non_increasing_video_pts")
             if severe_gap_intervals:
@@ -526,6 +546,7 @@ class TimingMixin:
                 "reported_avg_frame_rate": round(avg_frame_rate, 3) if avg_frame_rate else None,
                 "effective_fps": round(effective_fps, 3) if effective_fps else None,
                 "fps_error_percent": round(fps_error_percent, 3) if fps_error_percent is not None else None,
+                "effective_fps_validation_applicable": fps_validation_applicable,
                 "non_positive_interval_count": len(non_positive_intervals),
                 "very_short_interval_count": len(very_short_intervals),
                 "severe_gap_count": len(severe_gap_intervals),

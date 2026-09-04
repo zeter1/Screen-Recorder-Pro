@@ -94,26 +94,33 @@ def main() -> int:
         "_is_owned_problem_log_item",
         "build_python_loopback_sync_plan", "build_python_loopback_audio_filter",
         "summarize_python_loopback_audio_sync", "classify_visual_motion_window",
-        "should_draw_native_recording_cursor", "get_recording_cursor_render_mode",
-        "build_cursor_overlay_geometry", "get_tk_toplevel_hwnd",
+        "classify_recording_video_progress_health",
+        "classify_ffmpeg_capture_stderr",
+        "classify_input_desktop_name",
+        "should_restart_after_capture_access_lost",
+        "capture_signal_matches",
+        "start_ffmpeg_stderr_reader",
+        "wait_for_ffmpeg_stderr_reader",
+        "_poll_automatic_segment_restart_result",
+        "should_rollover_coreaudio_segment",
+        "calculate_coreaudio_segment_rollover_seconds",
+        "is_segment_video_capture_truncated",
+        "calculate_python_loopback_mix_timeout",
+        "is_effective_fps_validation_applicable",
+        "should_draw_native_recording_cursor",
+        "get_recording_cursor_render_mode",
+        "build_cursor_overlay_geometry",
+        "get_tk_toplevel_hwnd",
         "position_cursor_overlay_window",
+        "close_recording_problem_log_session",
+        "summarize_resource_pressure",
+        "summarize_visual_diagnostic_coverage",
     }
     missing = sorted(required - methods)
     if missing:
         print("ОШИБКА: отсутствуют методы:", ", ".join(missing))
         return 1
 
-    print("4. Регрессионная проверка выбора системного звука...")
-    invalid_only = ScreenRecorderProWin11.find_default_system_audio_device(
-        ["Microphone", "Analogue 1 + 2 (Focusrite)"]
-    )
-    if invalid_only != NO_AUDIO:
-        print("ОШИБКА: микрофон ошибочно признан источником системного звука:", invalid_only)
-        return 1
-
-    valid = ScreenRecorderProWin11.find_default_system_audio_device(
-        ["Microphone", "Stereo Mix (Realtek Audio)"]
-    )
     print("3б. Регрессионная проверка размера курсора в записи...")
     if tuple(RECORDING_CURSOR_SIZE_PERCENT_OPTIONS) != (50, 75, 100, 125, 150, 175, 200, 250, 300):
         print("ОШИБКА: изменился поддерживаемый набор размеров курсора.")
@@ -153,6 +160,8 @@ def main() -> int:
     if (
         "RTCTIME-RTCSTART" not in stable_filter
         or stable_filter.count("fps=72:round=near") != 1
+        or "tpad=" in stable_filter
+        or "realtime=" in stable_filter
         or "setpts=N*" in stable_filter
         or "hwdownload" in stable_filter
     ):
@@ -178,6 +187,14 @@ def main() -> int:
     cursor_app.recording_refresh_hz = 144
     if cursor_app.get_ddagrab_poll_fps(72) != 144:
         print("ОШИБКА: 144 Гц / 72 FPS больше не даёт ddagrab poll 144.")
+        return 1
+    gdigrab_filter = cursor_app.build_smooth_video_filter(
+        72,
+        use_nvenc=False,
+        capture_backend="gdigrab",
+    )
+    if "tpad=" in gdigrab_filter:
+        print("ОШИБКА: secure-desktop stop-frame затронул gdigrab:", gdigrab_filter)
         return 1
 
     cursor_app.recording_cursor_size_percent = 200
@@ -323,6 +340,17 @@ def main() -> int:
         print("ОШИБКА: размер курсора не сохраняется в settings.json.")
         return 1
 
+    print("4. Регрессионная проверка выбора системного звука...")
+    invalid_only = ScreenRecorderProWin11.find_default_system_audio_device(
+        ["Microphone", "Analogue 1 + 2 (Focusrite)"]
+    )
+    if invalid_only != NO_AUDIO:
+        print("ОШИБКА: микрофон ошибочно признан источником системного звука:", invalid_only)
+        return 1
+
+    valid = ScreenRecorderProWin11.find_default_system_audio_device(
+        ["Microphone", "Stereo Mix (Realtek Audio)"]
+    )
     if valid != "Stereo Mix (Realtek Audio)":
         print("ОШИБКА: Stereo Mix не был найден:", valid)
         return 1
@@ -344,6 +372,174 @@ def main() -> int:
         return 1
     if ScreenRecorderProWin11.is_python_loopback_duration_incomplete(30.0, 29.5):
         print("ОШИБКА: допустимая разница длительности CoreAudio ошибочно признана обрывом.")
+        return 1
+    stalled_health = ScreenRecorderProWin11.classify_recording_video_progress_health(
+        "ddagrab", 100.0, 0.0, 90.0, 194047, stall_seconds=6.0
+    )
+    if stalled_health.get("status") != "frame_stalled":
+        print("ERROR: frozen ddagrab frame counter was not detected:", stalled_health)
+        return 1
+    healthy_progress = ScreenRecorderProWin11.classify_recording_video_progress_health(
+        "ddagrab", 100.0, 0.0, 99.0, 194048, stall_seconds=6.0
+    )
+    if healthy_progress.get("status") != "healthy":
+        print("ERROR: advancing ddagrab frame counter was classified as stalled:", healthy_progress)
+        return 1
+    gdigrab_progress = ScreenRecorderProWin11.classify_recording_video_progress_health(
+        "gdigrab", 100.0, 0.0, 10.0, 1
+    )
+    if gdigrab_progress.get("status") != "not_applicable":
+        print("ERROR: ddagrab-only watchdog affected another backend:", gdigrab_progress)
+        return 1
+    if ScreenRecorderProWin11.classify_ffmpeg_capture_stderr(
+        "AcquireNextFrame failed: 887a0026",
+        "ddagrab",
+    ) != "dxgi_access_lost":
+        print("ERROR: DXGI access-lost marker was not recognized.")
+        return 1
+    if ScreenRecorderProWin11.classify_ffmpeg_capture_stderr(
+        "AcquireNextFrame failed: 887a0026",
+        "gdigrab",
+    ) is not None:
+        print("ERROR: ddagrab-only stderr marker affected gdigrab.")
+        return 1
+    if ScreenRecorderProWin11.classify_input_desktop_name("Default") != "default":
+        print("ERROR: normal Windows desktop was not recognized.")
+        return 1
+    if ScreenRecorderProWin11.classify_input_desktop_name("Winlogon") != "non_default":
+        print("ERROR: secure Windows desktop was not separated from Default.")
+        return 1
+    if ScreenRecorderProWin11.should_restart_after_capture_access_lost("unavailable", 30.0):
+        print("ERROR: recovery would restart while the secure desktop is still active.")
+        return 1
+    if not ScreenRecorderProWin11.should_restart_after_capture_access_lost("default", 0.0):
+        print("ERROR: recovery did not resume on the Default desktop.")
+        return 1
+    current_signal = {
+        "recording_session_id": "verify-session",
+        "segment_index": 2,
+        "process_generation": 4,
+        "ffmpeg_pid": 4242,
+    }
+    if not ScreenRecorderProWin11.capture_signal_matches(
+        current_signal,
+        "verify-session",
+        2,
+        4,
+        4242,
+    ):
+        print("ERROR: current capture signal was rejected.")
+        return 1
+    if ScreenRecorderProWin11.capture_signal_matches(
+        current_signal,
+        "verify-session",
+        2,
+        5,
+        4242,
+    ):
+        print("ERROR: stale capture generation was accepted.")
+        return 1
+
+    stderr_app = object.__new__(ScreenRecorderProWin11)
+    stderr_app.recording_session_id = "verify-session"
+    stderr_app.segment_index = 2
+    stderr_app.recording_capture_signal_queue = queue.Queue(maxsize=4)
+    stderr_app.recording_stderr_threads = []
+    stderr_app.log_message = lambda _message: None
+    stderr_reader_errors = []
+    stderr_app.log_exception = lambda context, exc: stderr_reader_errors.append((context, repr(exc)))
+    with tempfile.TemporaryDirectory(prefix="screen_recorder_stderr_verify_") as temp_name:
+        temp_root = Path(temp_name)
+        stderr_source = temp_root / "stderr_source.bin"
+        stderr_log = temp_root / "stderr.log"
+        raw_stderr = (
+            b"x" * 4090
+            + b"AcquireNextFrame failed: 887a0026\r\n"
+        )
+        stderr_source.write_bytes(raw_stderr)
+
+        class FakeProcess:
+            pid = 4242
+
+        fake_process = FakeProcess()
+        fake_process.stderr = stderr_source.open("rb")
+        stderr_thread = stderr_app.start_ffmpeg_stderr_reader(
+            fake_process,
+            log_path=stderr_log,
+            segment_path=temp_root / "segment_0002.mp4",
+            capture_backend="ddagrab",
+            process_generation=4,
+        )
+        stderr_thread.join(timeout=2.0)
+        fake_process.stderr.close()
+        if stderr_thread.is_alive() or stderr_reader_errors:
+            print("ERROR: stderr reader did not finish cleanly:", stderr_reader_errors)
+            return 1
+        queued_signal = stderr_app.recording_capture_signal_queue.get_nowait()
+        if not ScreenRecorderProWin11.capture_signal_matches(
+            queued_signal,
+            "verify-session",
+            2,
+            4,
+            4242,
+        ):
+            print("ERROR: stderr reader queued a stale or incomplete signal:", queued_signal)
+            return 1
+        if stderr_log.read_bytes() != raw_stderr:
+            print("ERROR: stderr reader did not preserve the complete FFmpeg log.")
+            return 1
+    if not ScreenRecorderProWin11.should_rollover_coreaudio_segment(0.0, 14400.0, True):
+        print("ERROR: four-hour CoreAudio segment rollover was not requested.")
+        return 1
+    if ScreenRecorderProWin11.should_rollover_coreaudio_segment(0.0, 14399.0, True):
+        print("ERROR: CoreAudio segment rollover was requested too early.")
+        return 1
+    rollover_48k = ScreenRecorderProWin11.calculate_coreaudio_segment_rollover_seconds(48000)
+    rollover_96k = ScreenRecorderProWin11.calculate_coreaudio_segment_rollover_seconds(96000)
+    if rollover_48k != 14400.0:
+        print("ERROR: 48 kHz CoreAudio rollover changed unexpectedly:", rollover_48k)
+        return 1
+    if not (60.0 < rollover_96k < rollover_48k):
+        print("ERROR: high sample rate did not shorten safe WAV rollover:", rollover_96k)
+        return 1
+    if not ScreenRecorderProWin11.is_segment_video_capture_truncated(2695.0, 26489.0):
+        print("ERROR: audio continuing after video capture was not detected.")
+        return 1
+    if ScreenRecorderProWin11.is_segment_video_capture_truncated(30.0, 30.5):
+        print("ERROR: normal A/V duration tolerance was classified as truncation.")
+        return 1
+    if ScreenRecorderProWin11.calculate_python_loopback_mix_timeout(14400.0, 14400.0) <= 180:
+        print("ERROR: long CoreAudio mix still uses the short fixed timeout.")
+        return 1
+    if ScreenRecorderProWin11.is_effective_fps_validation_applicable(0.521, 36, 72):
+        print("ERROR: sub-second clip still receives fatal effective-FPS validation.")
+        return 1
+    if not ScreenRecorderProWin11.is_effective_fps_validation_applicable(10.0, 720, 72):
+        print("ERROR: normal recording skipped effective-FPS validation.")
+        return 1
+    progress_reader_source = inspect.getsource(ScreenRecorderProWin11.start_ffmpeg_progress_reader)
+    watchdog_source = inspect.getsource(ScreenRecorderProWin11._recording_watchdog_tick)
+    restart_worker_source = inspect.getsource(ScreenRecorderProWin11._automatic_segment_restart_worker)
+    restart_poll_source = inspect.getsource(ScreenRecorderProWin11._poll_automatic_segment_restart_result)
+    restart_finish_source = inspect.getsource(ScreenRecorderProWin11._finish_automatic_segment_restart)
+    launch_segment_source = inspect.getsource(ScreenRecorderProWin11.launch_checked_ffmpeg_segment)
+    if "current_segment_last_video_frame_advance_perf" not in progress_reader_source:
+        print("ERROR: progress reader no longer records advancing video-frame time.")
+        return 1
+    if "request_automatic_segment_restart" not in watchdog_source:
+        print("ERROR: video watchdog is disconnected from segment recovery.")
+        return 1
+    if "stop_current_segment" not in restart_worker_source or "start_new_segment" not in restart_finish_source:
+        print("ERROR: automatic recovery does not use the safe segment lifecycle.")
+        return 1
+    if "root.after" in restart_worker_source or "put_nowait" not in restart_worker_source:
+        print("ERROR: recovery worker still touches Tkinter or no longer returns through a queue.")
+        return 1
+    if "_finish_automatic_segment_restart" not in restart_poll_source:
+        print("ERROR: main-thread recovery poll is disconnected from restart completion.")
+        return 1
+    if "stderr=subprocess.PIPE" not in launch_segment_source or "start_ffmpeg_stderr_reader" not in launch_segment_source:
+        print("ERROR: recording stderr is not drained by the dedicated reader.")
         return 1
 
     early_plan = ScreenRecorderProWin11.build_python_loopback_sync_plan(100.0, 101.25)
@@ -382,6 +578,117 @@ def main() -> int:
         return 1
 
     diagnostics_app = ScreenRecorderProWin11.__new__(ScreenRecorderProWin11)
+
+    sustained_pressure = diagnostics_app.summarize_resource_pressure(
+        [99.7, 99.5, 99.4, 99.0, 99.5, 99.1], threshold=95.0
+    )
+    if sustained_pressure.get("status") != "sustained_saturation":
+        print("ОШИБКА: устойчивая CPU-перегрузка классифицирована как единичный пик:", sustained_pressure)
+        return 1
+    brief_pressure = diagnostics_app.summarize_resource_pressure([20.0, 99.0, 25.0], threshold=95.0)
+    if brief_pressure.get("status") != "brief_or_intermittent_peak":
+        print("ОШИБКА: единичный CPU-пик ошибочно признан устойчивой перегрузкой:", brief_pressure)
+        return 1
+
+    static_visual_coverage = diagnostics_app.summarize_visual_diagnostic_coverage({
+        "status": "ok",
+        "analyzed_frame_count": 2114,
+        "moving_content_cadence_analysis": {"moving_window_count": 0},
+    })
+    if (
+        static_visual_coverage.get("status") != "insufficient_continuous_motion"
+        or static_visual_coverage.get("can_assess_visual_smoothness")
+    ):
+        print("ОШИБКА: статичный тест ошибочно подтверждает визуальную плавность:", static_visual_coverage)
+        return 1
+    moving_visual_coverage = diagnostics_app.summarize_visual_diagnostic_coverage({
+        "status": "ok",
+        "analyzed_frame_count": 2784,
+        "moving_content_cadence_analysis": {"moving_window_count": 6},
+    })
+    if not moving_visual_coverage.get("can_assess_visual_smoothness"):
+        print("ОШИБКА: достаточное движение не признано пригодным для анализа:", moving_visual_coverage)
+        return 1
+
+    diagnostics_app.recording_performance_lock = threading.RLock()
+    diagnostics_app.recording_performance_samples = [{
+        "system_cpu_measurement_warmup": True,
+        "system_cpu_percent": 0.0,
+        "perf_counter": 0.0,
+        "disk_io_total": {"read_bytes": 0, "write_bytes": 0},
+        "ffmpeg_process": {"write_bytes_total": 0},
+    }]
+    for index in range(1, 7):
+        sample = {
+            "system_cpu_measurement_warmup": False,
+            "system_cpu_percent": 99.0,
+            "system_cpu_per_core_percent": [100.0, 98.0],
+            "perf_counter": float(index),
+            "disk_io_total": {"read_bytes": index * 2000, "write_bytes": index * 1000},
+            "ffmpeg_process": {"write_bytes_total": index * 500},
+            "memory": {"percent": 80.0},
+            "swap": {"percent": 0.0, "used_bytes": 0, "sin_bytes_total": 0, "sout_bytes_total": 0},
+            "output_disk": {"free_bytes": 10_000_000},
+        }
+        if index == 3:
+            sample["high_cpu_process_attribution"] = {
+                "status": "ok",
+                "top_processes": [{"pid": 123, "name": "load.exe"}],
+            }
+        diagnostics_app.recording_performance_samples.append(sample)
+    performance_summary = diagnostics_app.summarize_performance_samples()
+    if (
+        (performance_summary.get("system_cpu_percent") or {}).get("min") != 99.0
+        or (performance_summary.get("system_cpu_pressure") or {}).get("status") != "sustained_saturation"
+        or performance_summary.get("cpu_measurement_warmup_samples_excluded") != 1
+        or len(performance_summary.get("high_cpu_process_attribution_snapshots") or []) != 1
+        or not performance_summary.get("system_disk_read_bytes_per_second")
+    ):
+        print("ОШИБКА: расширенная performance-сводка потеряла evidence:", performance_summary)
+        return 1
+
+    with tempfile.TemporaryDirectory(prefix="screen_recorder_session_log_test_") as temp_dir:
+        session_app = ScreenRecorderProWin11.__new__(ScreenRecorderProWin11)
+        session_app.should_write_problem_logs = lambda: True
+        session_app.get_problem_log_file_limit_bytes = lambda: 1_000_000
+        session_app._problem_log_file_lock = threading.RLock()
+        session_app._session_events_truncated = False
+        session_app.diagnostic_started_perf = 0.0
+        session_app.recording_session_id = "session-a"
+        session_app._session_log_owner_id = "session-a"
+        session_app._session_log_accepts_live_events = True
+        session_app.session_events_path = Path(temp_dir) / "events.jsonl"
+        session_app.session_errors_path = Path(temp_dir) / "errors.txt"
+        session_app.session_ffmpeg_path = Path(temp_dir) / "ffmpeg.txt"
+        session_app.session_events_path.write_text("", encoding="utf-8")
+        session_app.session_errors_path.write_text("errors header\n", encoding="utf-8")
+        session_app.session_ffmpeg_path.write_text("ffmpeg header\n", encoding="utf-8")
+        session_app.problem_log_event("recording_event", {"ok": True})
+        if not session_app.close_recording_problem_log_session("session-a", reason="test_complete"):
+            print("ОШИБКА: session-log не закрылся для своего owner id.")
+            return 1
+        session_app.problem_log_event("unrelated_after_close", {})
+        session_app.append_problem_error("unrelated_after_close", "must stay global")
+        session_app.append_ffmpeg_problem_log("unrelated_after_close", command=["ffmpeg", "-version"])
+        rows = [json.loads(line) for line in session_app.session_events_path.read_text(encoding="utf-8").splitlines()]
+        if len(rows) != 2 or rows[-1].get("event") != "recording_problem_log_session_closed":
+            print("ОШИБКА: закрытый session-log продолжает принимать обычные события:", rows)
+            return 1
+        if session_app.session_errors_path.read_text(encoding="utf-8") != "errors header\n":
+            print("ОШИБКА: закрытый 04-файл получил несвязанный traceback.")
+            return 1
+        if session_app.session_ffmpeg_path.read_text(encoding="utf-8") != "ffmpeg header\n":
+            print("ОШИБКА: закрытый 02-файл получил несвязанную FFmpeg-команду.")
+            return 1
+        session_app._session_log_owner_id = "session-b"
+        session_app._session_log_accepts_live_events = True
+        if session_app.close_recording_problem_log_session("session-a", reason="stale_worker"):
+            print("ОШИБКА: старый post-save worker закрыл новую session-log.")
+            return 1
+        if not session_app._session_log_accepts_live_events:
+            print("ОШИБКА: owner guard не сохранил новую session-log активной.")
+            return 1
+
     healthy_bursty_verdict = diagnostics_app.build_automatic_smoothness_verdict(
         {"timing_health": {"status": "ok"}},
         {
@@ -473,6 +780,22 @@ def main() -> int:
                 test_wav.setsampwidth(2)
                 test_wav.setframerate(48000)
                 test_wav.writeframes(b"\x00" * frame_count * 4)
+        valid_wav = WasapiLoopbackWaveRecorder.inspect_wav_file(output_wav)
+        if not valid_wav.get("valid"):
+            print("ERROR: a normal generated WAV failed header validation:", valid_wav)
+            return 1
+        invalid_wav = Path(temp_dir) / "invalid_header.wav"
+        with wave.open(str(invalid_wav), "wb") as test_wav:
+            test_wav.setnchannels(2)
+            test_wav.setsampwidth(2)
+            test_wav.setframerate(48000)
+            test_wav.writeframes(b"\x00" * 40)
+        with invalid_wav.open("ab") as invalid_file:
+            invalid_file.write(b"trailing-pcm-not-declared")
+        invalid_details = WasapiLoopbackWaveRecorder.inspect_wav_file(invalid_wav)
+        if invalid_details.get("valid") or invalid_details.get("reason") != "wav_header_size_mismatch":
+            print("ERROR: inconsistent WAV header/body size was not rejected:", invalid_details)
+            return 1
         recorder._merge_wav_parts([output_wav, reconnect_wav])
         with wave.open(str(output_wav), "rb") as merged_wav:
             if merged_wav.getnframes() != 300:

@@ -1,3 +1,5 @@
+import math
+
 from ..shared import *
 
 
@@ -138,6 +140,154 @@ class FinalizeMixin:
             )
         return out_path
 
+    @staticmethod
+    def build_capture_recovery_plan(video_duration, target_duration, fps):
+        """Конечное число clone-кадров; неизвестную длительность не угадываем."""
+        video, target, rate = (float(value) for value in (video_duration, target_duration, fps))
+        if not all(math.isfinite(value) and value > 0 for value in (video, target, rate)):
+            raise ValueError("Неизвестна длительность или FPS сегмента для восстановления.")
+        padding_frames = max(0, math.ceil((target - video) * rate - 1e-6))
+        return {
+            "source_video_seconds": video,
+            "target_seconds": max(video, target),
+            "fps": rate,
+            "padding_frames": padding_frames,
+            "expected_video_seconds": video + padding_frames / rate,
+        }
+
+    @staticmethod
+    def capture_recovery_encoder_options(recording_command):
+        # Берём уже выбранный кодек и его параметры из фактической команды,
+        # а не из Tk-переменных в фоне. Границы принадлежат append_encoder_options.
+        command = list(recording_command)
+        start = command.index("-c:v")
+        end = command.index("-max_muxing_queue_size", start)
+        options = command[start:end]
+        if options[1] not in {"h264_nvenc", "hevc_nvenc", "libx264", "libx265"}:
+            raise ValueError("Неизвестный кодек исходного сегмента.")
+        return options
+
+    def build_capture_recovery_command(self, source, output, plan, recording_command):
+        options = self.capture_recovery_encoder_options(recording_command)
+        command = [
+            self.ffmpeg_path, "-n", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
+            "-vf", f"tpad=stop_mode=clone:stop={int(plan['padding_frames'])}",
+            *options, "-fps_mode", "passthrough", "-c:a", "copy",
+        ]
+        if Path(output).suffix.lower() in {".mp4", ".mov"}:
+            command += ["-movflags", "+faststart", "-video_track_timescale", str(self.MP4_VIDEO_TRACK_TIMESCALE)]
+            if options[1] in {"hevc_nvenc", "libx265"}:
+                command += ["-tag:v", "hvc1"]
+        return command + [str(output)]
+
+    def read_capture_recovery_tail(self, path, timing, fps):
+        """Небольшой декодированный последний кадр, а не только PTS/код возврата."""
+        seek = max(0.0, float(timing["video_end"]) - 3.0 / float(fps))
+        result = self.run_managed_process(
+            [self.ffmpeg_path, "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-ss", f"{seek:.6f}", "-i", str(path), "-map", "0:v:0",
+             "-vf", "scale=64:36,format=gray", "-frames:v", "4",
+             "-an", "-sn", "-f", "rawvideo", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+            creationflags=self.creation_flags(),
+        )
+        data = result.stdout or b""
+        if result.returncode != 0 or not data or len(data) % (64 * 36):
+            error = (result.stderr or b"").decode("utf-8", errors="replace")[-2000:]
+            raise RuntimeError(f"Не удалось декодировать последний кадр {path}: {error}")
+        return data[-64 * 36:]
+
+    def prepare_segments_with_capture_recovery(self, segments):
+        """Дополняет только доказанные DXGI-разрывы, до -shortest при смешивании."""
+        prepared = []
+        recovery_segments = getattr(self, "capture_recovery_segments", {}) or {}
+        starts = getattr(self, "recording_segment_start_perfs", {}) or {}
+        for segment in segments:
+            source_key = str(segment)
+            metadata = recovery_segments.get(source_key)
+            if metadata is None:
+                prepared.append(segment)
+                continue
+            start = metadata.get("capture_start_perf")
+            resume_path = metadata.get("resume_segment_path")
+            end = starts.get(resume_path) if resume_path else metadata.get("stop_requested_perf")
+            if start is None or end is None or float(end) <= float(start):
+                raise RuntimeError("Нет достоверных границ DXGI-разрыва; исходные сегменты оставлены.")
+            timing = self.probe_av_stream_timing(segment)
+            if not timing:
+                raise RuntimeError("Не удалось проверить видеодорожку до восстановления.")
+            plan = self.build_capture_recovery_plan(
+                timing.get("video_duration"), float(end) - float(start), metadata.get("fps"),
+            )
+            output = Path(segment)
+            if plan["padding_frames"]:
+                # Уникальная staged-копия: не перезаписываем ни исходник, ни
+                # остаток прошлой попытки. На любой ошибке сохраняем оба файла.
+                fd, output_name = tempfile.mkstemp(
+                    prefix="capture_recovery_", suffix=Path(segment).suffix, dir=Path(segment).parent,
+                )
+                os.close(fd)
+                output = Path(output_name)
+                # Только что созданный пустой файл принадлежит этой операции.
+                output.unlink()
+                command = self.build_capture_recovery_command(segment, output, plan, metadata["ffmpeg_args"])
+                self.append_ffmpeg_problem_log("finite capture recovery start", command=command, extra=plan)
+                result = self.run_managed_process(
+                    command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace",
+                    timeout=max(180, int(plan["expected_video_seconds"] * 2 + 120)),
+                    creationflags=self.creation_flags(),
+                )
+                self.append_ffmpeg_problem_log("finite capture recovery finish", command=command, extra={
+                    "return_code": result.returncode, "stderr": (result.stderr or "")[-4000:],
+                })
+                if result.returncode != 0:
+                    raise RuntimeError(f"Не удалось дополнить DXGI-разрыв: {(result.stderr or '')[-2000:]}")
+                self.validate_media_file(output, label="сегмент с конечным стоп-кадром")
+                verified = self.probe_av_stream_timing(output)
+                actual = float((verified or {}).get("video_duration") or 0)
+                if abs(actual - plan["expected_video_seconds"]) > max(0.12, 2.0 / plan["fps"]):
+                    raise RuntimeError(f"Неверная длительность stop-frame: {actual}; ожидалось {plan['expected_video_seconds']}")
+                before_tail = self.read_capture_recovery_tail(segment, timing, plan["fps"])
+                after_tail = self.read_capture_recovery_tail(output, verified, plan["fps"])
+                tail_error = sum(abs(a - b) for a, b in zip(before_tail, after_tail)) / len(before_tail)
+                if tail_error > 6.0:
+                    raise RuntimeError(f"Стоп-кадр не совпал с последним исходным кадром: mean_error={tail_error:.3f}")
+            else:
+                actual = float(timing["video_duration"])
+                tail_error = 0.0
+
+            # Только проверенная копия допускается к смешиванию/склейке. WAV
+            # сохраняет исходный якорь, а не привязывается к новому имени файла.
+            output_key = str(output)
+            if output_key != source_key:
+                wav_path = self.python_loopback_audio_segments.get(source_key)
+                if wav_path is not None:
+                    self.python_loopback_audio_segments[output_key] = wav_path
+                sync_metadata = self.python_loopback_sync_metadata.pop(source_key, None)
+                if sync_metadata is not None:
+                    sync_metadata["source_segment_path"] = source_key
+                    sync_metadata["segment_path"] = output_key
+                    self.python_loopback_sync_metadata[output_key] = sync_metadata
+            old_media = metadata.get("accounted_media_seconds", metadata.get("committed_media_seconds", 0.0))
+            old_wall = metadata.get("accounted_wall_seconds", metadata.get("committed_wall_seconds", 0.0))
+            self.recorded_seconds += actual - float(old_media)
+            self.recorded_wall_seconds += (float(end) - float(start)) - float(old_wall)
+            metadata.update({
+                "status": "validated", "output": output_key, "plan": plan,
+                "tail_mean_absolute_error": tail_error,
+                "accounted_media_seconds": actual,
+                "accounted_wall_seconds": float(end) - float(start),
+            })
+            self.problem_log_event("capture_recovery_segment_validated", {
+                "source": source_key, "output": output_key, "plan": plan,
+                "tail_mean_absolute_error": tail_error,
+                "audio_policy": "keep captured audio; restart gaps cannot be recovered",
+            }, level="WARN")
+            prepared.append(output)
+        return prepared
+
     def merge_segments(self):
         valid_segments = []
         invalid_segments = []
@@ -160,6 +310,7 @@ class FinalizeMixin:
         if not valid_segments:
             raise RuntimeError(f"Нет валидных записанных сегментов. Проверь лог: {self.current_log_path}")
 
+        valid_segments = self.prepare_segments_with_capture_recovery(valid_segments)
         valid_segments = self.prepare_segments_with_python_loopback_audio(valid_segments)
         valid_segments = self.prepare_segments_with_aligned_audio(valid_segments)
 

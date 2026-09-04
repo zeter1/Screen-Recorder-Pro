@@ -2,6 +2,21 @@ from ..shared import *
 
 
 class RecordingControlMixin:
+    def remember_capture_recovery_segment(self, signal):
+        """Отмечает только подтверждённый DXGI-сбой, не обещая готовый stop-frame."""
+        segment_key = str(signal["segment_path"])
+        self.capture_recovery_segments.setdefault(segment_key, {
+            "status": "pending_segment_close",
+            "signal": dict(signal),
+            "ffmpeg_args": list(getattr(self, "recording_ffmpeg_args", []) or []),
+            "fps": getattr(self, "recording_effective_fps", None),
+        })
+        if not getattr(self, "recording_failure_reason", None):
+            self.recording_failure_reason = (
+                "Windows прервал захват рабочего стола (в том числе при открытии "
+                "защищённого экрана). Недоступный интервал отмечен для восстановления."
+            )
+
     def get_current_segment_duration_counters(self, segment_perf_end=None):
         """Возвращает (media_seconds, wall_seconds, source) для текущего сегмента.
 
@@ -52,6 +67,17 @@ class RecordingControlMixin:
             pass
 
         source = "ffmpeg_progress_out_time"
+        if getattr(self, "current_segment_video_stall_detected", False):
+            try:
+                last_video_seconds = max(
+                    0.0,
+                    float(self.current_segment_last_video_frame_out_time_seconds or 0.0),
+                )
+            except Exception:
+                last_video_seconds = 0.0
+            if last_video_seconds > 0.001:
+                media_seconds = min(media_seconds, last_video_seconds)
+                source = "last_advancing_video_frame_out_time"
         if media_seconds <= 0.001:
             media_seconds = wall_seconds
             source = "wall_clock_fallback_no_progress"
@@ -60,6 +86,13 @@ class RecordingControlMixin:
     def commit_current_segment_duration(self, segment_perf_end=None, reason="segment_stop"):
         """Добавляет длительность сегмента в общий таймер и пишет объяснимый лог."""
         media_seconds, wall_seconds, source = self.get_current_segment_duration_counters(segment_perf_end)
+        segment_key = str(self.segments[-1]) if self.segments else None
+        if segment_key and getattr(self, "segment_capture_started_perf", None) is not None:
+            self.recording_segment_start_perfs[segment_key] = float(self.segment_capture_started_perf)
+        recovery = (getattr(self, "capture_recovery_segments", {}) or {}).get(segment_key)
+        if recovery is not None:
+            recovery["committed_media_seconds"] = media_seconds
+            recovery["committed_wall_seconds"] = wall_seconds
         self.recorded_seconds += max(0.0, media_seconds)
         self.recorded_wall_seconds += max(0.0, wall_seconds)
         payload = {
@@ -78,6 +111,10 @@ class RecordingControlMixin:
         self.segment_capture_started_perf = None
         self.current_segment_media_seconds = 0.0
         self.current_segment_last_progress_perf = None
+        self.current_segment_last_video_frame_value = None
+        self.current_segment_last_video_frame_advance_perf = None
+        self.current_segment_last_video_frame_out_time_seconds = None
+        self.current_segment_video_stall_detected = False
         return payload
 
     def toggle_pause(self):
@@ -198,6 +235,205 @@ class RecordingControlMixin:
                 self.annotation_overlay.update_pause_button_text()
             self.set_rec_state("recording")
             self.status_var.set("Запись продолжена...")
+        except Exception:
+            pass
+
+    def request_automatic_segment_restart(self, reason_kind, details=None):
+        if (
+            not self.is_recording
+            or self.is_paused
+            or self.is_finalizing
+            or getattr(self, "is_pause_transitioning", False)
+        ):
+            return False
+
+        payload = dict(details or {})
+        payload["reason_kind"] = str(reason_kind)
+        self.is_pause_transitioning = True
+        self.cancel_recording_watchdog()
+        self.automatic_segment_restart_generation += 1
+        restart_generation = self.automatic_segment_restart_generation
+        restart_session_id = self.recording_session_id
+        result_queue = self.automatic_segment_restart_result_queue
+        while True:
+            try:
+                result_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.diagnostic_log("automatic_segment_restart_started", payload, level="WARN")
+        try:
+            self.pause_button.configure(state="disabled", text="⏳ Восстанавливаю...")
+            self.stop_button.configure(state="disabled")
+            if self.annotation_overlay:
+                self.annotation_overlay.update_record_controls()
+            self.set_rec_state("saving")
+            self.status_var.set("Восстанавливаю захват: закрываю текущий сегмент и запускаю новый...")
+        except Exception:
+            pass
+
+        self.automatic_segment_restart_thread = threading.Thread(
+            target=self._automatic_segment_restart_worker,
+            args=(
+                str(reason_kind),
+                payload,
+                restart_generation,
+                restart_session_id,
+                result_queue,
+            ),
+            name="automatic_segment_restart_worker",
+            daemon=True,
+        )
+        self.automatic_segment_restart_thread.start()
+        self.automatic_segment_restart_poll_job = self.root.after(
+            50,
+            lambda generation=restart_generation: self._poll_automatic_segment_restart_result(
+                generation
+            ),
+        )
+        return True
+
+    def _automatic_segment_restart_worker(
+        self,
+        reason_kind,
+        details,
+        restart_generation,
+        restart_session_id,
+        result_queue,
+    ):
+        ok = False
+        error_text = None
+        try:
+            segment_perf_end = time.perf_counter()
+            self.stop_current_segment()
+            if self.segment_started_at is not None:
+                self.commit_current_segment_duration(
+                    segment_perf_end,
+                    reason=f"automatic_restart:{reason_kind}",
+                )
+            ok = True
+        except Exception as exc:
+            self.log_exception("automatic_segment_restart_worker", exc)
+            error_text = str(exc)
+        finally:
+            result = {
+                "restart_generation": int(restart_generation),
+                "recording_session_id": restart_session_id,
+                "stop_ok": bool(ok),
+                "reason_kind": str(reason_kind),
+                "details": dict(details or {}),
+                "error_text": error_text,
+            }
+            try:
+                result_queue.put_nowait(result)
+            except queue.Full:
+                try:
+                    result_queue.get_nowait()
+                    result_queue.put_nowait(result)
+                except Exception as exc:
+                    self.log_exception(
+                        "automatic_segment_restart_worker.enqueue_result",
+                        exc,
+                    )
+
+    def _poll_automatic_segment_restart_result(self, restart_generation):
+        """Главный Tk-поток принимает результат worker через очередь."""
+        self.automatic_segment_restart_poll_job = None
+        if int(restart_generation) != int(self.automatic_segment_restart_generation):
+            return
+
+        selected = None
+        result_queue = self.automatic_segment_restart_result_queue
+        while True:
+            try:
+                result = result_queue.get_nowait()
+            except queue.Empty:
+                break
+            if (
+                int(result.get("restart_generation", -1)) == int(restart_generation)
+                and str(result.get("recording_session_id")) == str(self.recording_session_id)
+            ):
+                selected = result
+
+        if selected is not None:
+            self._finish_automatic_segment_restart(
+                selected.get("stop_ok"),
+                selected.get("reason_kind"),
+                selected.get("details"),
+                selected.get("error_text"),
+            )
+            return
+
+        if not self.running or not self.is_recording or self.is_finalizing:
+            self.is_pause_transitioning = False
+            return
+        self.automatic_segment_restart_poll_job = self.root.after(
+            100,
+            lambda generation=restart_generation: self._poll_automatic_segment_restart_result(
+                generation
+            ),
+        )
+
+    def _finish_automatic_segment_restart(self, stop_ok, reason_kind, details, error_text=None):
+        self.automatic_segment_restart_thread = None
+        if not self.is_recording or self.is_finalizing:
+            self.is_pause_transitioning = False
+            return
+
+        restart_ok = False
+        previous_segment = str(self.segments[-1]) if self.segments else None
+        if stop_ok:
+            try:
+                self.start_new_segment()
+                recovery = (getattr(self, "capture_recovery_segments", {}) or {}).get(previous_segment)
+                if recovery is not None:
+                    recovery["resume_segment_path"] = str(self.segments[-1])
+                restart_ok = True
+            except Exception as exc:
+                self.log_exception("automatic_segment_restart.start_new_segment", exc)
+                error_text = str(exc)
+
+        if not restart_ok:
+            reason = (
+                "Не удалось автоматически восстановить запись после сбоя сегмента"
+                + (f": {error_text}" if error_text else ".")
+            )
+            self.recording_failure_reason = reason
+            failure_details = dict(details or {})
+            failure_details.update({
+                "reason_kind": reason_kind,
+                "stop_ok": bool(stop_ok),
+                "error": error_text,
+                "reason": reason,
+            })
+            self.diagnostic_log("automatic_segment_restart_failed", failure_details, level="ERROR")
+            self.append_problem_error("automatic_segment_restart_failed", reason)
+            self.is_pause_transitioning = False
+            try:
+                self.status_var.set(reason + " Сохраняю доступные сегменты...")
+            except Exception:
+                pass
+            self.stop_recording()
+            return
+
+        self.is_pause_transitioning = False
+        success_details = dict(details or {})
+        success_details.update({
+            "reason_kind": reason_kind,
+            "new_segment_index": self.segment_index,
+            "new_segment_path": str(self.segments[-1]) if self.segments else None,
+        })
+        self.diagnostic_log("automatic_segment_restart_succeeded", success_details, level="WARN")
+        self.schedule_recording_watchdog()
+        try:
+            self.pause_button.configure(state="normal", text="⏸ Пауза")
+            self.stop_button.configure(state="normal")
+            if self.annotation_overlay:
+                self.annotation_overlay.update_record_controls()
+            self.set_rec_state("recording")
+            if reason_kind == "coreaudio_wav_size_guard":
+                self.status_var.set("Запись продолжается в новом сегменте: длинный WAV безопасно закрыт.")
+            else:
+                self.status_var.set("Захват восстановлен. Запись продолжается в новом сегменте.")
         except Exception:
             pass
 
@@ -470,11 +706,22 @@ class RecordingControlMixin:
 
                 if not exit_after_finalize:
                     if failure_reason:
+                        if "защищённ" in str(failure_reason).casefold():
+                            recovery_note = (
+                                "Защищённый экран Windows нельзя записать обычной "
+                                "программой. Недоступный интервал дополнен последним "
+                                "доступным кадром. Записанный звук сохранён; во время "
+                                "перезапуска источников возможен короткий перерыв звука."
+                            )
+                        else:
+                            recovery_note = (
+                                "Программа сохранила доступную корректную часть записи. "
+                                "Проверь указанный в предупреждении источник."
+                            )
                         messagebox.showwarning(
                             "Запись сохранена с предупреждением",
                             f"{failure_reason}\n\n"
-                            "Программа сохранила доступную корректную часть записи. "
-                            "Проверь указанный в предупреждении источник:\n"
+                            f"{recovery_note}\n"
                             f"{self.last_output_path}{log_note}",
                         )
                         opened = False
@@ -496,6 +743,11 @@ class RecordingControlMixin:
                     messagebox.showerror("Ошибка сохранения", f"Не удалось собрать итоговый файл.\n\n{error_text}\n\nПапка логов проблем: {log_folder}\nЛог записи: {log_path}\nОбщий лог: {diagnostic_latest}")
                 self.status_var.set(f"Ошибка сохранения. Папка логов: {log_folder or diagnostic_latest or log_path}")
         finally:
+            if not save_success:
+                self.close_recording_problem_log_session(
+                    recording_session_id=self.recording_session_id,
+                    reason="recording_failed_ui_completed",
+                )
             if exit_after_finalize and self.running:
                 self._exit_after_finalize = False
                 try:
@@ -622,6 +874,25 @@ class RecordingControlMixin:
             except subprocess.TimeoutExpired:
                 self.log_message("FFmpeg segment did not finish after stdin EOF; terminating process tree. Segment will be validated before final merge.")
                 self.terminate_process_tree(process, timeout=2.0, name="ffmpeg_recording_segment")
+
+        # stdout progress и stderr имеют собственных читателей. После выхода
+        # процесса даём stderr-reader ограниченное время дочитать хвост и
+        # закрыть принадлежащий ему файловый handle; бесконечного join нет.
+        self.wait_for_ffmpeg_stderr_reader(process, timeout=1.0)
+
+        # Стоп мог прийти раньше watchdog. Дочитанный stderr всё равно должен
+        # пометить этот же сегмент; чужой session/generation/PID не принимается.
+        capture_signal = self._consume_current_capture_signal(process)
+        if capture_signal and capture_signal.get("kind") == "dxgi_access_lost":
+            self.remember_capture_recovery_segment(capture_signal)
+        segment_key = str(self.segments[-1]) if self.segments else None
+        recovery = (getattr(self, "capture_recovery_segments", {}) or {}).get(segment_key)
+        if recovery is not None:
+            recovery.update({
+                "status": "pending_finite_padding",
+                "capture_start_perf": self.segment_capture_started_perf,
+                "stop_requested_perf": segment_stop_started,
+            })
 
         try:
             self.stop_python_loopback_for_current_segment()

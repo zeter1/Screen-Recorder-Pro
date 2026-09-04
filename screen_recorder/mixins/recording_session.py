@@ -14,6 +14,10 @@ class RecordingSessionMixin:
         # Если после предыдущей записи ещё идёт тяжёлый визуальный анализ логов,
         # новая запись важнее: просим фоновый FFmpeg-анализ немедленно завершиться.
         self.cancel_post_save_diagnostics(reason="new_recording")
+        self.close_recording_problem_log_session(
+            recording_session_id=getattr(self, "_session_log_owner_id", None),
+            reason="new_recording_requested",
+        )
 
         self.is_starting = True
         self.cancel_start_requested = False
@@ -144,9 +148,42 @@ class RecordingSessionMixin:
             self.segment_first_progress_out_time = None
             self.current_segment_media_seconds = 0.0
             self.current_segment_last_progress_perf = None
+            self.current_segment_last_video_frame_value = None
+            self.current_segment_last_video_frame_advance_perf = None
+            self.current_segment_last_video_frame_out_time_seconds = None
+            self.current_segment_video_stall_detected = False
+            self.recording_capture_recovery_attempts = 0
+            self.recording_stderr_threads = [
+                entry
+                for entry in list(getattr(self, "recording_stderr_threads", []) or [])
+                if entry.get("thread") and entry["thread"].is_alive()
+            ]
+            self.recording_capture_signal_queue = queue.Queue(maxsize=32)
+            self.recording_process_generation = 0
+            self.current_capture_access_lost = None
+            self.current_capture_access_lost_wait_logged = False
+            self.capture_recovery_segments = {}
+            self.recording_segment_start_perfs = {}
+            self.recording_ffmpeg_args = []
+            self.automatic_segment_restart_thread = None
+            self.automatic_segment_restart_generation += 1
+            self.automatic_segment_restart_result_queue = queue.Queue(maxsize=8)
+            previous_restart_poll = getattr(self, "automatic_segment_restart_poll_job", None)
+            self.automatic_segment_restart_poll_job = None
+            if previous_restart_poll:
+                try:
+                    self.root.after_cancel(previous_restart_poll)
+                except Exception:
+                    pass
             with self.recording_performance_lock:
                 self.recording_performance_samples = []
             self.recording_performance_stop_event = threading.Event()
+            self._performance_cpu_measurement_count = 0
+            self._performance_high_cpu_consecutive = 0
+            self._performance_high_cpu_snapshot_count = 0
+            self._performance_high_cpu_last_snapshot_perf = 0.0
+            self._performance_process_cpu_handles = {}
+            self._performance_process_cpu_last_snapshot_perf = None
             self.last_video_timing_summary = None
             self.last_frame_content_analysis = None
             self.last_ai_smoothness_report = None
@@ -384,21 +421,37 @@ class RecordingSessionMixin:
             "command": self.command_to_log_text(command),
         })
 
+        self.recording_process_generation += 1
+        process_generation = self.recording_process_generation
+        self.current_capture_access_lost = None
+        self.current_capture_access_lost_wait_logged = False
         process_launch_perf = time.perf_counter()
         process = self.start_managed_process(
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=self.log_handle,
+            stderr=subprocess.PIPE,
             creationflags=self.recording_creation_flags(),
         )
         self.recording_capture_backend = capture_backend
         self.recording_ffmpeg_command = self.command_to_log_text(command)
+        self.recording_ffmpeg_args = list(command)
         self.recording_ffmpeg_pid = getattr(process, "pid", None)
         self.segment_capture_started_perf = None
         self.segment_first_progress_out_time = None
         self.current_segment_media_seconds = 0.0
         self.current_segment_last_progress_perf = None
+        self.current_segment_last_video_frame_value = None
+        self.current_segment_last_video_frame_advance_perf = None
+        self.current_segment_last_video_frame_out_time_seconds = None
+        self.current_segment_video_stall_detected = False
+        self.start_ffmpeg_stderr_reader(
+            process,
+            log_path=self.get_current_recording_log_path(),
+            segment_path=segment_path,
+            capture_backend=capture_backend,
+            process_generation=process_generation,
+        )
         self.start_ffmpeg_progress_reader(
             process,
             segment_path=segment_path,
@@ -425,6 +478,7 @@ class RecordingSessionMixin:
                     process.stdin.close()
             except Exception:
                 pass
+            self.wait_for_ffmpeg_stderr_reader(process, timeout=1.0)
             self.unregister_child_process(process)
             raise RuntimeError(f"FFmpeg сразу завершился с кодом {code}. Лог: {self.current_log_path}")
 
