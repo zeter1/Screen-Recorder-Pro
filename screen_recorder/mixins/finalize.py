@@ -529,16 +529,24 @@ class FinalizeMixin:
         self.run_merge_command(command)
 
     def run_merge_command(self, command):
+        command = list(command)
+        candidate = getattr(self, "pending_output_path", None)
+        if candidate is not None:
+            command[-1] = str(candidate)
+            command = ["-n" if arg == "-y" else arg for arg in command]
+        if "-nostdin" not in command:
+            command.insert(1, "-nostdin")
+        merge_output = Path(command[-1])
         log_path = self.get_current_recording_log_path()
         merge_timeout = 1800
         self.append_ffmpeg_problem_log("merge command start", command=command, extra={
-            "output_path": self.output_path,
+            "output_path": merge_output,
             "segments": [str(p) for p in self.segments],
             "timeout_sec": merge_timeout,
         })
         self.diagnostic_log("merge_command_start", {
             "command": self.command_to_log_text(command),
-            "output_path": self.output_path,
+            "output_path": merge_output,
             "segments": [str(p) for p in self.segments],
             "timeout_sec": merge_timeout,
         })
@@ -563,7 +571,7 @@ class FinalizeMixin:
                 self.diagnostic_log("merge_command_timeout", {
                     "timeout_sec": merge_timeout,
                     "command": self.command_to_log_text(command),
-                    "output_path": self.output_path,
+                    "output_path": merge_output,
                 }, level="ERROR")
                 raise RuntimeError(
                     f"FFmpeg завис при финальной сборке дольше {merge_timeout} секунд. "
@@ -572,18 +580,18 @@ class FinalizeMixin:
             finally:
                 self.unregister_child_process(process)
             log.write(f"merge_elapsed={time.perf_counter() - merge_started:.2f}s\n")
-        self.append_ffmpeg_problem_log("merge command finish", command=command, extra={"return_code": return_code, "elapsed_sec": round(time.perf_counter() - merge_started, 3), "output_path": self.output_path})
+        self.append_ffmpeg_problem_log("merge command finish", command=command, extra={"return_code": return_code, "elapsed_sec": round(time.perf_counter() - merge_started, 3), "output_path": merge_output})
         if return_code != 0:
             self.diagnostic_log("merge_command_failed", {
                 "return_code": return_code,
                 "command": self.command_to_log_text(command),
-                "output_path": self.output_path,
+                "output_path": merge_output,
             }, level="ERROR")
             self.append_problem_error("merge_command_failed", f"return_code={return_code}\ncommand={self.command_to_log_text(command)}\nlog={log_path}")
             raise RuntimeError(f"FFmpeg завершился с кодом {return_code}. Лог: {log_path}")
         self.diagnostic_log("merge_command_finish", {
             "return_code": return_code,
-            "output_path": self.output_path,
-            "exists": bool(self.output_path and Path(self.output_path).exists()),
-            "size_bytes": Path(self.output_path).stat().st_size if self.output_path and Path(self.output_path).exists() else None,
+            "output_path": merge_output,
+            "exists": merge_output.exists(),
+            "size_bytes": merge_output.stat().st_size if merge_output.exists() else None,
         })

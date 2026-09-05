@@ -600,6 +600,12 @@ class ProcessMixin:
                 video_health.get("status") == "healthy"
                 and attempts > 0
                 and healthy_segment_seconds >= 3.0
+                # Process age and audio out_time do not prove video recovery.
+                and float(last_frame or 0) >= max(
+                    2.0, 3.0 * float(getattr(self, "recording_effective_fps", None)
+                                    or getattr(self, "recording_requested_fps", None) or 30)
+                )
+                and now_perf - float(self.current_segment_last_video_frame_advance_perf or 0) <= 1.0
             ):
                 self.recording_capture_recovery_attempts = 0
                 self.diagnostic_log(

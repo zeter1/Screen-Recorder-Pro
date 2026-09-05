@@ -8,40 +8,52 @@ class FfmpegSupportMixin:
 
     def make_output_path_at_save_time(self):
         folder = Path(self.output_folder.get().strip() or os.getcwd())
-        folder.mkdir(parents=True, exist_ok=True)
         ext = self.format_var.get().lower().strip() or "mkv"
         stamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
         base = f"Запись экрана {stamp}"
-        output = folder / f"{base}.{ext}"
+        # No destination I/O before the capture process has been stopped.
+        return folder / f"{base}.{ext}"
+
+    def prepare_recording_output(self):
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        stage = Path(tempfile.mkdtemp(prefix=".recording_save_", dir=self.output_path.parent))
+        self.pending_output_path = stage / f"{self.output_path.stem}.pending{self.output_path.suffix}"
+        return self.pending_output_path
+
+    def publish_recording_output(self):
+        source = self.pending_output_path
+        desired = self.output_path
+        target = desired
         counter = 2
-        while output.exists():
-            output = folder / f"{base} ({counter}).{ext}"
-            counter += 1
-        return output
+        while True:
+            try:
+                if os.name == "nt":
+                    # Same-volume Windows rename refuses even a late collision.
+                    os.rename(source, target)
+                else:
+                    os.link(source, target)
+                break
+            except FileExistsError:
+                target = desired.with_name(f"{desired.stem} ({counter}){desired.suffix}")
+                counter += 1
+        self.output_path = target
+        self.pending_output_path = None
+        try:
+            if os.name != "nt":
+                source.unlink()
+            source.parent.rmdir()
+        except OSError as exc:
+            self.log_exception("publish_recording_output.cleanup", exc)
+        return target
 
     def quarantine_incomplete_output(self):
-        """Убирает неуспешный результат из-под обычного имени готовой записи."""
-        path = Path(self.output_path) if self.output_path else None
+        """Retain only this save's staged file; never touch the public destination."""
+        path = getattr(self, "pending_output_path", None)
         if not path or not path.exists():
             return None
-        base = f"{path.stem} (неполный)"
-        target = path.with_name(base + path.suffix)
-        counter = 2
-        while target.exists():
-            target = path.with_name(f"{base} ({counter}){path.suffix}")
-            counter += 1
-        try:
-            os.replace(path, target)
-            self.incomplete_output_path = target
-            self.diagnostic_log(
-                "incomplete_output_quarantined",
-                {"source": path, "target": target},
-                level="WARN",
-            )
-            return target
-        except Exception as exc:
-            self.log_exception("quarantine_incomplete_output", exc)
-            return None
+        self.incomplete_output_path = path
+        self.diagnostic_log("incomplete_output_quarantined", {"source": path, "target": path}, level="WARN")
+        return path
 
     def check_ffmpeg(self):
         # Раньше при каждом старте записи выполнялся ffmpeg -version. Даже если

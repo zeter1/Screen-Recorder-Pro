@@ -454,6 +454,10 @@ class RecordingControlMixin:
         итогового файла — выполняется в отдельном потоке. Tkinter остаётся
         отзывчивым, а FFmpeg получает корректный EOF вместо принудительного kill.
         """
+        if getattr(self, "is_starting", False):
+            # Startup pumps Tk events before publishing the process and segment.
+            self._stop_after_start_requested = True
+            return
         if not self.is_recording or self.is_finalizing or getattr(self, "is_pause_transitioning", False):
             self.diagnostic_log("stop_recording_ignored", {
                 "is_recording": self.is_recording,
@@ -467,13 +471,15 @@ class RecordingControlMixin:
                 pass
             return
 
+        output_path = self.make_output_path_at_save_time()
+        audio_bitrate = self.normalize_audio_bitrate_value(self.audio_bitrate_var.get())
         self.cancel_auto_stop()
         self.cancel_recording_watchdog()
         self.recording_stop_requested_perf = time.perf_counter()
         self.is_finalizing = True
         was_paused = bool(self.is_paused)
-        self.recording_audio_bitrate = self.normalize_audio_bitrate_value(self.audio_bitrate_var.get())
-        self.output_path = self.make_output_path_at_save_time()
+        self.recording_audio_bitrate = audio_bitrate
+        self.output_path = output_path
         self.diagnostic_log("stop_recording_requested", {
             "recording_session_id": self.recording_session_id,
             "was_paused": was_paused,
@@ -502,6 +508,7 @@ class RecordingControlMixin:
 
     def _stop_recording_worker(self, was_paused):
         save_success = False
+        self.pending_output_path = None
         error_text = None
         debug_log = None
         post_diagnostics_context = None
@@ -524,8 +531,9 @@ class RecordingControlMixin:
             except Exception as exc:
                 self.log_exception("stop_recording_worker.schedule_cursor_overlay_stop", exc)
 
+            candidate = self.prepare_recording_output()
             self.merge_segments()
-            self.validate_media_file(self.output_path, label="итоговый файл")
+            self.validate_media_file(candidate, label="итоговый файл")
             request_to_stop_seconds = None
             try:
                 if self.recording_start_requested_perf is not None and self.recording_stop_requested_perf is not None:
@@ -537,7 +545,7 @@ class RecordingControlMixin:
                 request_to_stop_seconds = None
             self.stop_recording_performance_sampler()
             timing_summary = self.log_video_timing_summary(
-                self.output_path,
+                candidate,
                 label="итоговый файл",
                 expected_wall_seconds=self.recorded_wall_seconds,
                 expected_media_seconds=self.recorded_seconds,
@@ -545,15 +553,25 @@ class RecordingControlMixin:
             )
             self.last_video_timing_summary = timing_summary
             self.validate_final_timing_summary(timing_summary)
+            self.publish_recording_output()
             save_success = True
-            post_diagnostics_context = self.build_post_save_diagnostics_context(
-                timing_summary,
-                outcome="saved",
-            )
-            # Пользовательский результат уже готов. Тяжёлый декод/анализ кадров
-            # запускается позже в фоне и больше не задерживает окно «Сохранено».
-            self.write_pending_post_diagnostics_report(post_diagnostics_context)
-            debug_log = self.copy_debug_log_to_output()
+            if timing_summary is not None:
+                timing_summary["path"] = str(self.output_path)
+            try:
+                timing_path = getattr(self, "session_timing_detail_path", None)
+                if timing_path and timing_summary is not None:
+                    Path(timing_path).write_text(
+                        json.dumps(timing_summary, ensure_ascii=False, indent=2), encoding="utf-8",
+                    )
+                post_diagnostics_context = self.build_post_save_diagnostics_context(
+                    timing_summary,
+                    outcome="saved",
+                )
+                # A report failure cannot revoke an already validated and published video.
+                self.write_pending_post_diagnostics_report(post_diagnostics_context)
+                debug_log = self.copy_debug_log_to_output()
+            except Exception as exc:
+                self.log_exception("stop_recording_worker.post_save_diagnostics", exc)
         except Exception as exc:
             self.log_exception("stop_recording_worker", exc)
             error_text = str(exc)

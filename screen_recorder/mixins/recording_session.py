@@ -20,6 +20,7 @@ class RecordingSessionMixin:
         )
 
         self.is_starting = True
+        self._stop_after_start_requested = False
         self.cancel_start_requested = False
         self.diagnostic_log("start_recording_requested", {
             "settings": self.collect_settings_snapshot(),
@@ -195,6 +196,7 @@ class RecordingSessionMixin:
             self._last_gpu_sample_perf = 0.0
             self.write_ai_problem_summary(outcome="Запись подготовлена; ожидается первый кадр FFmpeg.")
             self.output_path = None
+            self.pending_output_path = None
             self.incomplete_output_path = None
             self.recording_failure_reason = None
             self.is_recording = True
@@ -272,6 +274,10 @@ class RecordingSessionMixin:
             # Cursor overlay уже запущен до FFmpeg, чтобы он был в первом кадре.
         finally:
             self.is_starting = False
+            stop_after_start = getattr(self, "_stop_after_start_requested", False)
+            self._stop_after_start_requested = False
+            if stop_after_start and self.is_recording and not self.is_finalizing:
+                self.stop_recording()
             try:
                 if self.annotation_overlay:
                     self.annotation_overlay.update_record_controls()

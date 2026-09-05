@@ -136,6 +136,7 @@ class ScreenRecorderProWin11(
         # плавающей панели не запускал второй старт поверх первого, пока
         # FFmpeg/DXcam ещё готовятся.
         self.is_starting = False
+        self._stop_after_start_requested = False
         self.running = True
         self.initializing = True
         self.finalize_thread = None
@@ -224,6 +225,7 @@ class ScreenRecorderProWin11(
         self.recorded_seconds = 0.0
         self.recorded_wall_seconds = 0.0
         self.output_path = None
+        self.pending_output_path = None
         self.last_output_path = None
         self.last_debug_log_path = None
 

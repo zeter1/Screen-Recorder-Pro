@@ -134,6 +134,45 @@ class SaveSafety(unittest.TestCase):
         recovered=self.app.assemble_recovered_session(self.session,[source])
         self.assertEqual(self.app.inspect_recovery_video(recovered)['frames'],60)
 
+    def test_normal_save_candidate_and_collision_keep_scenes_and_audio(self):
+        first = self.video(1, color='red')
+        second = self.video(2, color='blue')
+        self.wav(first)
+        self.wav(second)
+        app = self.app
+        app.current_session_log_dir = None
+        for sources in ([first], [first, second]):
+            with self.subTest(segments=len(sources)):
+                app.segments = sources
+                app.output_path = self.root / f'normal_{len(sources)}.mp4'
+                destination = app.output_path
+                for source in sources:
+                    app.python_loopback_audio_segments[str(source)] = source.with_suffix('.system_loopback.wav')
+                    app.python_loopback_sync_metadata[str(source)] = {
+                        'sync_plan': app.build_python_loopback_sync_plan(100, 100)}
+                candidate = app.prepare_recording_output()
+                app.merge_segments()
+                self.assertFalse(destination.exists())
+                info = app.inspect_recovery_video(candidate)
+                merge_events = [data for event, data in app.events if event == 'merge_command_finish']
+                self.assertEqual(merge_events[-1]['output_path'], candidate)
+                self.assertTrue(merge_events[-1]['exists'])
+                self.assertEqual(merge_events[-1]['size_bytes'], candidate.stat().st_size)
+                self.assertEqual(info['frames'], 30 * len(sources))
+                self.assertTrue(info['audio'])
+                self.assertEqual(self.raw(candidate), b''.join(self.raw(source) for source in sources))
+                timing = info['timing']
+                self.assertLess(abs(timing['audio_start'] - timing['video_start']), 0.1)
+                self.assertLess(abs(timing['audio_end'] - timing['video_end']), 0.15)
+                pcm = self.raw(candidate, audio=True)
+                values = struct.unpack(f'<{len(pcm)//2}h', pcm)
+                self.assertGreater(math.sqrt(sum(x*x for x in values)/len(values)), 1000)
+                destination.write_bytes(b'existing recording')
+                saved = app.publish_recording_output()
+                self.assertEqual(destination.read_bytes(), b'existing recording')
+                self.assertEqual(app.inspect_recovery_video(saved)['frames'], 30 * len(sources))
+                self.assertTrue(all(source.exists() for source in sources))
+
 class AutoStopSafety(unittest.TestCase):
     def app(self):
         app=object.__new__(ScreenRecorderProWin11)
