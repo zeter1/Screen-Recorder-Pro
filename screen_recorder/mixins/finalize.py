@@ -23,7 +23,8 @@ class FinalizeMixin:
 
     def recover_orphan_segments(self):
         """Ищет сегменты от упавшего прошлого сеанса и предлагает собрать их."""
-        if getattr(self, "is_recording", False) or getattr(self, "is_finalizing", False):
+        if (getattr(self, "is_recording", False) or getattr(self, "is_finalizing", False)
+                or getattr(self, "is_starting", False) or getattr(self, "_exiting", False)):
             return
         try:
             roots = []
@@ -49,12 +50,13 @@ class FinalizeMixin:
                     for session_dir in sorted(root.iterdir()):
                         if not session_dir.is_dir() or session_dir == current:
                             continue
-                        segs = sorted(
-                            list(session_dir.glob("segment_*.mkv"))
-                            + list(session_dir.glob("segment_*.mp4"))
-                            + list(session_dir.glob("segment_*.nut"))
-                        )
-                        segs = [s for s in segs if s.stat().st_size > 0]
+                        try:
+                            segs = self.select_recovery_segments(session_dir)
+                        except Exception:
+                            # Let the worker report this folder's exact validation error,
+                            # without hiding it or skipping other recoverable sessions.
+                            orphans.append((session_dir, ()))
+                            continue
                         if segs:
                             orphans.append((session_dir, segs))
                 except Exception:
@@ -69,75 +71,224 @@ class FinalizeMixin:
             ):
                 return
 
-            recovered = []
-            for session_dir, segs in orphans:
-                try:
-                    out = self.assemble_recovered_session(session_dir, segs)
-                    if out:
-                        recovered.append(out)
-                except Exception as exc:
-                    self.log_exception("assemble_recovered_session", exc)
-            if recovered:
-                messagebox.showinfo(
-                    "Восстановление завершено",
-                    "Восстановлены файлы:\n" + "\n".join(str(p) for p in recovered),
-                )
-            else:
-                messagebox.showwarning("Восстановление", "Не удалось собрать ни одного файла. Сегменты оставлены на месте.")
+            self.start_orphan_recovery(orphans)
         except Exception as exc:
             self.log_exception("recover_orphan_segments", exc)
 
-    def assemble_recovered_session(self, session_dir, segs):
-        out_dir = Path(self.output_folder.get().strip() or os.getcwd())
-        out_dir.mkdir(parents=True, exist_ok=True)
-        base_name = f"Восстановленная запись {session_dir.name}"
-        out_path = out_dir / f"{base_name}.mkv"
-        counter = 2
-        while out_path.exists() or out_path.with_name(out_path.stem + ".partial" + out_path.suffix).exists():
-            out_path = out_dir / f"{base_name} ({counter}).mkv"
-            counter += 1
-        partial_path = out_path.with_name(out_path.stem + ".partial" + out_path.suffix)
-
-        if len(segs) == 1:
-            cmd = [
-                self.ffmpeg_path, "-y", "-hide_banner", "-loglevel", "warning",
-                "-fflags", "+genpts", "-i", str(segs[0]),
-                "-c", "copy", "-avoid_negative_ts", "make_zero", str(partial_path),
-            ]
-        else:
-            list_path = session_dir / "recover_list.txt"
-            with open(list_path, "w", encoding="utf-8") as file:
-                for seg in segs:
-                    safe = str(seg).replace("\\", "/").replace("'", "'\\''")
-                    file.write(f"file '{safe}'\n")
-            cmd = [
-                self.ffmpeg_path, "-y", "-hide_banner", "-loglevel", "warning",
-                "-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i", str(list_path),
-                "-c", "copy", "-avoid_negative_ts", "make_zero", str(partial_path),
-            ]
-
-        result = self.run_managed_process(
-            cmd, capture_output=True, text=True, timeout=180, creationflags=self.creation_flags()
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                "FFmpeg не восстановил запись: "
-                f"код {result.returncode}; {(result.stderr or '').strip()}"
-            )
-        self.validate_media_file(partial_path, label="восстановленная запись")
-        os.replace(partial_path, out_path)
-        self.validate_media_file(out_path, label="восстановленная запись")
-
-        # Исходные сегменты удаляем только после успешной сборки, проверки и
-        # атомарного появления готового файла под окончательным именем.
+    def start_orphan_recovery(self, orphans):
+        # Confirmation dialogs process Tk events: recheck state after the dialog closed.
+        if (self.is_recording or self.is_finalizing or getattr(self, "is_starting", False)
+                or getattr(self, "_exiting", False)):
+            return
+        output_folder = Path(self.output_folder.get().strip() or os.getcwd())
+        results = queue.Queue(maxsize=1)
+        self._orphan_recovery_results = results
+        self.is_finalizing = True
+        self.status_var.set("Восстанавливаю запись; исходные файлы будут сохранены...")
+        worker = threading.Thread(target=self.orphan_recovery_worker,
+                                  args=(tuple(orphans), output_folder, results),
+                                  name="orphan_recording_recovery", daemon=True)
+        self._orphan_recovery_thread = worker
         try:
-            shutil.rmtree(session_dir)
-        except Exception as exc:
-            self.diagnostic_log(
-                "recovered_session_cleanup_failed",
-                {"session_dir": session_dir, "output_path": out_path, "error": repr(exc)},
-                level="WARN",
-            )
+            worker.start()
+        except Exception:
+            self.is_finalizing = False
+            self._orphan_recovery_results = None
+            raise
+        self._orphan_recovery_poll_job = self.root.after(100, lambda: self.poll_orphan_recovery(results))
+
+    def orphan_recovery_worker(self, orphans, output_folder, results):
+        recovered, errors = [], []
+        for session_dir, segs in orphans:
+            try:
+                recovered.append(self.assemble_recovered_session(session_dir, segs, output_folder=output_folder))
+            except Exception as exc:
+                errors.append(f"{Path(session_dir).name}: {exc}")
+                try:
+                    self.log_exception("assemble_recovered_session", exc)
+                except Exception:
+                    pass
+        results.put_nowait((recovered, errors))
+
+    def poll_orphan_recovery(self, results):
+        # Only the Tk thread owns this poller and UI changes; an old result cannot finish a new job.
+        if getattr(self, "_orphan_recovery_results", None) is not results:
+            return
+        self._orphan_recovery_poll_job = None
+        try:
+            recovered, errors = results.get_nowait()
+        except queue.Empty:
+            self._orphan_recovery_poll_job = self.root.after(100, lambda: self.poll_orphan_recovery(results))
+            return
+        self._orphan_recovery_results = None
+        self._orphan_recovery_thread = None
+        self.is_finalizing = False
+        self.status_var.set("Восстановление завершено." if not errors else "Восстановление завершено с ошибками; исходники сохранены.")
+        if getattr(self, "_exit_after_finalize", False):
+            self.exit_app()
+            return
+        message = "Исходные сегменты и звук сохранены в папках .recording_temp."
+        if recovered:
+            message += "\n\nВосстановлены файлы:\n" + "\n".join(str(path) for path in recovered)
+        if errors:
+            message += "\n\nНе удалось восстановить:\n" + "\n".join(errors)
+            messagebox.showwarning("Восстановление", message)
+        else:
+            messagebox.showinfo("Восстановление завершено", message)
+
+    @staticmethod
+    def select_recovery_segments(session_dir):
+        """Only numbered originals, never previously mixed/aligned derivatives."""
+        by_index = {}
+        for path in Path(session_dir).iterdir():
+            match = re.fullmatch(r"segment_(\d+)\.(mp4|mkv|nut)", path.name, re.IGNORECASE)
+            if not match or not path.is_file():
+                continue
+            if path.is_symlink():
+                raise RuntimeError("Ссылка вместо исходного сегмента; восстановление остановлено.")
+            index = int(match.group(1))
+            if index in by_index:
+                raise RuntimeError(f"Несколько исходников сегмента {index}; файлы сохранены.")
+            by_index[index] = path
+        if by_index and sorted(by_index) != list(range(1, max(by_index) + 1)):
+            raise RuntimeError("Отсутствуют исходные сегменты; неполная запись не будет выдана за полную.")
+        return [by_index[key] for key in sorted(by_index)]
+
+    def inspect_recovery_video(self, path):
+        self.validate_media_file(path, label="сегмент восстановления")
+        result = self.run_managed_process(
+            [self.get_ffprobe_path(), "-v", "error", "-count_frames", "-show_entries",
+             "stream=codec_type,codec_name,width,height,nb_read_frames", "-of", "json", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1800,
+            creationflags=self.creation_flags(),
+        )
+        if result.returncode != 0 or (result.stderr or "").strip():
+            raise RuntimeError(f"Повреждён поток восстановления: {result.stderr}")
+        streams = json.loads(result.stdout).get("streams") or []
+        video = next(item for item in streams if item.get("codec_type") == "video")
+        frames = int(video.get("nb_read_frames") or 0)
+        timing = self.probe_av_stream_timing(path)
+        duration = float((timing or {}).get("video_duration") or 0)
+        if frames <= 0 or not math.isfinite(duration) or duration <= 0:
+            raise RuntimeError("Не удалось проверить полноту сегмента восстановления.")
+        return {"frames": frames, "duration": duration, "timing": timing,
+                "audio": any(item.get("codec_type") == "audio" for item in streams),
+                "signature": (video.get("codec_name"), video.get("width"), video.get("height"))}
+
+    def load_recovery_loopback_plan(self, source, wav):
+        sidecar = wav.with_suffix(".sync.json")
+        if sidecar.exists():
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            if payload.get("schema") != "screen_recorder_loopback_recovery_v1":
+                raise RuntimeError("Неизвестный формат данных восстановления звука.")
+            for key, path in (("video", source), ("wav", wav)):
+                stat = path.stat()
+                expected = {"name": path.name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+                if payload.get(key) != expected:
+                    raise RuntimeError("Сегмент или WAV изменён после сохранения синхронизации; исходники сохранены.")
+        else:
+            # Older sessions may carry the same anchors in their existing diagnostic report.
+            report_path = LOGS_DIR / source.parent.name / "15_синхронизация_системного_звука.json"
+            report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+            matches = [item for item in report.get("segments", [])
+                       if Path(item.get("source_segment_path") or item.get("segment_path") or "").resolve() == source.resolve()
+                       and Path(item.get("wav_path") or "").resolve() == wav.resolve()
+                       and item.get("wav_size_bytes") == wav.stat().st_size
+                       and item.get("status") not in {"incomplete", "error"} and not item.get("stop_error")]
+            if len(matches) != 1:
+                raise RuntimeError("Нет достоверной синхронизации системного звука. Видео и WAV сохранены для восстановления.")
+            payload = matches[0]
+        anchors = [payload.get("loopback_capture_start_perf"), payload.get("video_capture_start_perf")]
+        if any(value is None or not math.isfinite(float(value)) for value in anchors):
+            raise RuntimeError("Нет достоверных временных якорей системного звука; исходники сохранены.")
+        return self.build_python_loopback_sync_plan(*anchors)
+
+    def assemble_recovered_session(self, session_dir, segs, output_folder=None):
+        session_dir = Path(session_dir)
+        # Re-enumerate at the execution boundary: callers cannot inject a derivative or omit an original.
+        segs = self.select_recovery_segments(session_dir)
+        if not segs or not self.get_ffprobe_path():
+            raise RuntimeError("Для проверки восстановления нужны исходные сегменты и ffprobe.")
+        details = [self.inspect_recovery_video(path) for path in segs]
+        if len({item["signature"] for item in details}) != 1:
+            raise RuntimeError("Форматы сегментов различаются; исходники сохранены для отдельного восстановления.")
+        wavs = [path.with_suffix(".system_loopback.wav") for path in segs]
+        if any(wav.with_suffix(".sync.json").exists() and not wav.exists() for wav in wavs):
+            raise RuntimeError("Отсутствует системный WAV, указанный в данных восстановления; исходники сохранены.")
+        plans = [self.load_recovery_loopback_plan(path, wav) if wav.exists() else None
+                 for path, wav in zip(segs, wavs)]
+        needs_audio = any(item["audio"] for item in details) or any(plan is not None for plan in plans)
+        out_dir = Path(output_folder) if output_folder is not None else Path(self.output_folder.get().strip() or os.getcwd())
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Stage on the destination volume; the recording temp root may be on another drive.
+        stage = Path(tempfile.mkdtemp(prefix=".recovery_candidate_", dir=out_dir))
+        prepared = []
+        for index, (source, info, wav, plan) in enumerate(zip(segs, details, wavs, plans)):
+            output = stage / f"part_{index:04d}.mkv"
+            cmd = [self.ffmpeg_path, "-n", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(source)]
+            if plan is not None:
+                from ..components.audio_loopback import WasapiLoopbackWaveRecorder
+                if not WasapiLoopbackWaveRecorder.inspect_wav_file(wav).get("valid"):
+                    raise RuntimeError("Повреждён системный WAV; исходники сохранены.")
+                wav_duration = float(self.get_media_duration(wav))
+                effective = max(0.0, wav_duration - plan["trim_loopback_start_seconds"]) + plan["delay_loopback_start_seconds"]
+                if abs(effective - info["duration"]) > 1.0:
+                    raise RuntimeError("Системный WAV не покрывает видеосегмент; исходники сохранены.")
+                cmd += ["-i", str(wav)]
+                audio_filter = self.build_python_loopback_audio_filter(plan)
+                if info["audio"]:
+                    graph = (f"[1:a:0]{audio_filter}[sys];"
+                             "[0:a:0][sys]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95,apad[out]")
+                else:
+                    graph = f"[1:a:0]{audio_filter},apad[out]"
+                cmd += ["-filter_complex", graph, "-map", "0:v:0", "-map", "[out]"]
+            elif needs_audio and not info["audio"]:
+                cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v:0", "-map", "1:a:0"]
+            else:
+                cmd += ["-map", "0:v:0"] + (["-map", "0:a:0", "-af", "apad"] if needs_audio else [])
+            cmd += ["-c:v", "copy"]
+            if needs_audio:
+                cmd += ["-c:a", "aac", "-b:a", self.get_recording_audio_bitrate_safe(), "-ar", "48000", "-ac", "2", "-shortest"]
+            cmd += [str(output)]
+            result = self.run_managed_process(cmd, capture_output=True, text=True, timeout=1800, creationflags=self.creation_flags())
+            if result.returncode != 0:
+                raise RuntimeError(f"Не удалось подготовить сегмент восстановления: {result.stderr}")
+            checked = self.inspect_recovery_video(output)
+            if checked["frames"] != info["frames"] or abs(checked["duration"] - info["duration"]) > 0.15 or checked["audio"] != needs_audio:
+                raise RuntimeError("Сегмент восстановления неполон; исходники сохранены.")
+            prepared.append(output)
+        list_path = stage / "segments.txt"
+        with list_path.open("w", encoding="utf-8") as file:
+            for path in prepared:
+                safe = str(path).replace("\\", "/").replace("'", "'\\''")
+                file.write(f"file '{safe}'\n")
+        partial = stage / "result.mkv"
+        result = self.run_managed_process(
+            [self.ffmpeg_path, "-n", "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-f", "concat", "-safe", "0", "-i", str(list_path), "-map", "0", "-c", "copy", str(partial)],
+            capture_output=True, text=True, timeout=1800, creationflags=self.creation_flags())
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg не восстановил запись: {result.stderr}")
+        final = self.inspect_recovery_video(partial)
+        if (final["frames"] != sum(item["frames"] for item in details)
+                or abs(final["duration"] - sum(item["duration"] for item in details)) > max(0.2, 0.1 * len(details))
+                or final["audio"] != needs_audio):
+            raise RuntimeError("Восстановленная запись не прошла проверку полноты; исходники сохранены.")
+        if needs_audio:
+            timing = final["timing"]
+            if timing.get("audio_end") is None or abs(timing["audio_end"] - timing["video_end"]) > max(0.2, 0.1 * len(details)):
+                raise RuntimeError("Звук восстановленной записи не покрывает видео; исходники сохранены.")
+        out_dir = Path(output_folder) if output_folder is not None else Path(self.output_folder.get().strip() or os.getcwd())
+        out_dir.mkdir(parents=True, exist_ok=True)
+        base = f"Восстановленная запись {session_dir.name}"
+        out_path = out_dir / f"{base}.mkv"
+        counter = 2
+        while out_path.exists():
+            out_path = out_dir / f"{base} ({counter}).mkv"
+            counter += 1
+        # Windows rename refuses to overwrite an existing target, including a late collision.
+        os.rename(partial, out_path)
+        self.diagnostic_log("recovered_session_sources_retained", {"session_dir": session_dir, "output_path": out_path})
         return out_path
 
     @staticmethod

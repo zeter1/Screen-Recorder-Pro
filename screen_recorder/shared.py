@@ -84,7 +84,7 @@ except Exception:
 DXCAM_CAPTURE_ENABLED = False
 
 APP_NAME = "ScreenRecorderProWin11"
-APP_BUILD = "2026-09-04-finite-capture-recovery-v26"
+APP_BUILD = "2026-09-05-save-recovery-safety-v27"
 DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v22"
 PROBLEM_LOGS_FOLDER_NAME = "Логи проблем"
 NO_AUDIO = "Не записывать"

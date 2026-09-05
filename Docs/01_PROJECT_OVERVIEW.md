@@ -35,7 +35,7 @@ NVIDIA GTX 1660 SUPER / NVENC
 В `screen_recorder/shared.py`:
 
 ```python
-APP_BUILD = "2026-09-04-finite-capture-recovery-v26"
+APP_BUILD = "2026-09-05-save-recovery-safety-v27"
 DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v22"
 DXCAM_CAPTURE_ENABLED = False
 ```

@@ -687,11 +687,16 @@ class InstantBufferMixin:
             minutes = 0
         if minutes > 0:
             try:
-                self._auto_stop_after_id = self.root.after(int(minutes * 60_000), self._auto_stop_trigger)
+                generation = self._auto_stop_generation
+                self._auto_stop_after_id = self.root.after(
+                    int(minutes * 60_000), lambda: self._auto_stop_trigger(generation)
+                )
             except Exception:
                 self._auto_stop_after_id = None
 
     def cancel_auto_stop(self):
+        self._auto_stop_generation = getattr(self, "_auto_stop_generation", 0) + 1
+        self._pending_auto_stop_generation = None
         after_id = getattr(self, "_auto_stop_after_id", None)
         if after_id:
             try:
@@ -700,14 +705,32 @@ class InstantBufferMixin:
                 pass
         self._auto_stop_after_id = None
 
-    def _auto_stop_trigger(self):
+    def _auto_stop_trigger(self, generation=None):
+        current = getattr(self, "_auto_stop_generation", 0)
+        if generation is not None and generation != current:
+            return
         self._auto_stop_after_id = None
         if self.is_recording and not self.is_finalizing:
+            if getattr(self, "is_pause_transitioning", False):
+                self._pending_auto_stop_generation = current
+                return
             try:
                 self.status_var.set("Авто-остановка по таймеру.")
             except Exception:
                 pass
             self.stop_recording()
+
+    def finish_pending_auto_stop(self):
+        generation = getattr(self, "_pending_auto_stop_generation", None)
+        if generation is None or getattr(self, "is_pause_transitioning", False):
+            return False
+        self._pending_auto_stop_generation = None
+        if (generation != getattr(self, "_auto_stop_generation", 0)
+                or not self.is_recording or self.is_finalizing
+                or getattr(self, "_exiting", False)):
+            return False
+        self._auto_stop_trigger(generation)
+        return True
 
     def _region_label(self):
         r = getattr(self, "capture_region", None)

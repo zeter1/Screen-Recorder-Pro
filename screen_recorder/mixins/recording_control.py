@@ -172,6 +172,8 @@ class RecordingControlMixin:
     def _finish_pause_recording(self, ok, error_text=None):
         self.is_pause_transitioning = False
         if not ok:
+            if self.finish_pending_auto_stop():
+                return
             self.schedule_recording_watchdog()
             try:
                 self.pause_button.configure(state="normal", text="⏸ Пауза")
@@ -185,6 +187,8 @@ class RecordingControlMixin:
                 pass
             return
         self.is_paused = True
+        if self.finish_pending_auto_stop():
+            return
         try:
             self.pause_button.configure(state="normal", text="▶ Продолжить")
             self.stop_button.configure(state="normal")
@@ -216,6 +220,8 @@ class RecordingControlMixin:
         except Exception as exc:
             self.log_exception("resume_recording.start_new_segment", exc)
             self.is_pause_transitioning = False
+            if self.finish_pending_auto_stop():
+                return
             try:
                 self.pause_button.configure(state="normal", text="▶ Продолжить")
                 self.stop_button.configure(state="normal")
@@ -227,6 +233,8 @@ class RecordingControlMixin:
             return
         self.is_paused = False
         self.is_pause_transitioning = False
+        if self.finish_pending_auto_stop():
+            return
         self.schedule_recording_watchdog()
         try:
             self.pause_button.configure(state="normal", text="⏸ Пауза")
@@ -416,6 +424,8 @@ class RecordingControlMixin:
             return
 
         self.is_pause_transitioning = False
+        if self.finish_pending_auto_stop():
+            return
         success_details = dict(details or {})
         success_details.update({
             "reason_kind": reason_kind,

@@ -397,6 +397,8 @@ class ScreenRecorderProWin11(
         self.auto_stop_minutes_var = tk.StringVar(value=str(self.settings.get("auto_stop_minutes", "0")))
         self.countdown_enabled_var = tk.BooleanVar(value=bool(self.settings.get("countdown_enabled", True)))
         self._auto_stop_after_id = None
+        self._auto_stop_generation = 0
+        self._pending_auto_stop_generation = None
         self.show_keys_overlay_var = tk.BooleanVar(value=bool(self.settings.get("show_keys_overlay", False)))
         self.open_folder_after_stop_var = tk.BooleanVar(value=bool(self.settings.get("open_folder_after_stop", False)))
 

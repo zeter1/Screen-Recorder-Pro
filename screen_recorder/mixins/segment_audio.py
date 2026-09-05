@@ -283,6 +283,27 @@ class SegmentAudioMixin:
         except Exception:
             pass
 
+    def persist_loopback_recovery_anchor(self, segment, wav_path, metadata):
+        """Single stop-worker owns this sidecar; it survives disabled diagnostic logs."""
+        metadata = metadata or {}
+        plan = self.build_python_loopback_sync_plan(
+            metadata.get("loopback_capture_start_perf"), metadata.get("video_capture_start_perf")
+        )
+        if plan.get("status") == "unknown_missing_monotonic_anchor":
+            return
+        payload = {"schema": "screen_recorder_loopback_recovery_v1",
+                   "loopback_capture_start_perf": metadata["loopback_capture_start_perf"],
+                   "video_capture_start_perf": metadata["video_capture_start_perf"]}
+        for key, value in (("video", segment), ("wav", wav_path)):
+            path = Path(value)
+            stat = path.stat()
+            payload[key] = {"name": path.name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        try:
+            atomic_write_text(Path(wav_path).with_suffix(".sync.json"),
+                              json.dumps(payload, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            self.log_exception("persist_loopback_recovery_anchor", exc)
+
     def stop_python_loopback_for_current_segment(self):
         recorder = self.current_python_loopback_recorder
         wav_path = self.current_python_loopback_path
@@ -378,6 +399,8 @@ class SegmentAudioMixin:
                     self.log_handle.flush()
                 if segment and wav_path and finished and size > 44:
                     self.python_loopback_audio_segments[str(Path(segment))] = Path(wav_path)
+                    if stop_error is None:
+                        self.persist_loopback_recovery_anchor(segment, wav_path, metadata)
                 elif segment:
                     self.python_loopback_audio_segments.pop(str(Path(segment)), None)
                     self.log_message(
@@ -538,10 +561,16 @@ class SegmentAudioMixin:
                 video_duration_before,
                 source_loopback_duration,
             )
+            trim_seconds = max(0.0, float(sync_plan.get("trim_loopback_start_seconds") or 0.0))
+            delay_seconds = max(0.0, float(sync_plan.get("delay_loopback_start_seconds") or 0.0))
+            effective_loopback_timeline_duration = (
+                max(0.0, float(source_loopback_duration) - trim_seconds) + delay_seconds
+                if source_loopback_duration is not None else None
+            )
             truncated_sources = []
             if self.is_segment_video_capture_truncated(video_duration_before, source_audio_duration):
                 truncated_sources.append("segment_audio")
-            if self.is_segment_video_capture_truncated(video_duration_before, source_loopback_duration):
+            if self.is_segment_video_capture_truncated(video_duration_before, effective_loopback_timeline_duration):
                 truncated_sources.append("coreaudio_loopback")
             if truncated_sources:
                 failure_details = {
@@ -550,6 +579,7 @@ class SegmentAudioMixin:
                     "video_duration_seconds": video_duration_before,
                     "segment_audio_duration_seconds": source_audio_duration,
                     "loopback_duration_seconds": source_loopback_duration,
+                    "effective_loopback_timeline_duration_seconds": effective_loopback_timeline_duration,
                     "truncated_sources": truncated_sources,
                     "tolerance_seconds": 10.0,
                 }
@@ -573,17 +603,11 @@ class SegmentAudioMixin:
                     f"video={float(video_duration_before):.3f} с, "
                     f"audio={max(float(value) for value in (source_audio_duration, source_loopback_duration) if value is not None):.3f} с."
                 )
-            trim_seconds = max(0.0, float(sync_plan.get("trim_loopback_start_seconds") or 0.0))
-            delay_seconds = max(0.0, float(sync_plan.get("delay_loopback_start_seconds") or 0.0))
             if source_loopback_duration is not None and trim_seconds >= max(0.0, float(source_loopback_duration) - 0.25):
                 raise RuntimeError(
                     "Рассчитанная обрезка начала CoreAudio исчерпывает WAV: "
                     f"trim={trim_seconds:.3f} с, wav={float(source_loopback_duration):.3f} с."
                 )
-            effective_loopback_timeline_duration = (
-                max(0.0, float(source_loopback_duration) - trim_seconds) + delay_seconds
-                if source_loopback_duration is not None else None
-            )
             if self.is_python_loopback_duration_incomplete(
                 video_duration_before,
                 effective_loopback_timeline_duration,
