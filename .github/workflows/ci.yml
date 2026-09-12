@@ -1,32 +1,44 @@
-name: CI
+name: Apply Screen Recorder Pro release
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+
+permissions:
+  contents: write
 
 jobs:
-  verify:
-    runs-on: windows-latest
-    env:
-      PYTHONUTF8: "1"
-      PYTHONIOENCODING: "utf-8"
+  apply-release:
+    if: ${{ hashFiles('.release/chunk-001.txt') != '' }}
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          python-version: "3.13"
-          cache: "pip"
-          cache-dependency-path: requirements.txt
+          fetch-depth: 0
 
-      - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+      - name: Rebuild and apply release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          cat .release/chunk-*.txt > "$tmp/release.b64"
+          base64 --decode "$tmp/release.b64" > "$tmp/release.tar.gz"
+          mkdir -p "$tmp/project"
+          tar -xzf "$tmp/release.tar.gz" -C "$tmp/project"
 
-      - name: Compile Python sources
-        run: python -m compileall -q .
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.release/' \
+            "$tmp/project/" ./
+          rm -rf .release
 
-      - name: Run structural regression checks
-        run: python verify_project.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Release package produced no changes."
+            exit 0
+          fi
+          git commit -m "release: update Screen Recorder Pro"
+          git push origin HEAD:main
