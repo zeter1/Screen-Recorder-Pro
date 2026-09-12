@@ -22,8 +22,74 @@ jobs:
           set -euo pipefail
           test -f .release/chunk-001.txt
           tmp="$(mktemp -d)"
-          cat .release/chunk-*.txt > "$tmp/release.b64"
-          base64 --decode "$tmp/release.b64" > "$tmp/release.tar.gz"
+          export RELEASE_TMP="$tmp"
+
+          python - <<'PY'
+          import base64
+          import glob
+          import io
+          import os
+          import re
+          import tarfile
+
+          paths = sorted(glob.glob('.release/chunk-*.txt'))
+          if not paths:
+              raise SystemExit('No release chunks found')
+
+          parts = []
+          for path in paths:
+              raw = open(path, 'rb').read().decode('ascii', errors='ignore')
+              clean = re.sub(r'[^A-Za-z0-9+/=]', '', raw)
+              parts.append(clean)
+              print(f'{path}: raw={len(raw)} clean={len(clean)} padding={clean.count("=")}')
+
+          candidates = []
+          joined = ''.join(parts)
+
+          def add_candidate(name, func):
+              try:
+                  data = func()
+                  candidates.append((name, data))
+                  print(f'{name}: decoded {len(data)} bytes')
+              except Exception as exc:
+                  print(f'{name}: decode failed: {exc}')
+
+          add_candidate('joined-strict', lambda: base64.b64decode(joined, validate=True))
+          add_candidate('joined-lenient', lambda: base64.b64decode(joined, validate=False))
+
+          def decode_parts():
+              out = bytearray()
+              for index, part in enumerate(parts, 1):
+                  padded = part + ('=' * (-len(part) % 4))
+                  try:
+                      out.extend(base64.b64decode(padded, validate=False))
+                  except Exception as exc:
+                      raise RuntimeError(f'part {index}: {exc}') from exc
+              return bytes(out)
+
+          add_candidate('per-part', decode_parts)
+
+          output = None
+          for name, data in candidates:
+              try:
+                  with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+                      names = archive.getnames()
+                      if not names:
+                          raise RuntimeError('empty archive')
+                      print(f'{name}: valid tar.gz with {len(names)} entries; first={names[0]}')
+                  output = data
+                  break
+              except Exception as exc:
+                  print(f'{name}: tar.gz validation failed: {exc}')
+
+          if output is None:
+              raise SystemExit('Unable to reconstruct a valid release tar.gz')
+
+          target = os.path.join(os.environ['RELEASE_TMP'], 'release.tar.gz')
+          open(target, 'wb').write(output)
+          print(f'Wrote valid release bundle: {target} ({len(output)} bytes)')
+          PY
+
           mkdir -p "$tmp/project"
           tar -xzf "$tmp/release.tar.gz" -C "$tmp/project"
 
