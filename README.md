@@ -1,45 +1,45 @@
 # Screen Recorder Pro
 
-**Windows screen recorder and screenshot tool built with Python, Tkinter and FFmpeg.**
+**Продвинутая программа для записи экрана и создания скриншотов в Windows на Python, Tkinter и FFmpeg.**
 
-Screen Recorder Pro is a modular Windows desktop application for screen recording, screenshots, microphone/system-audio capture, webcam preview and detailed recording diagnostics. The current source build is `2026-08-12-screenshot-toolbar-persistence-v16`.
+Screen Recorder Pro — модульное настольное приложение для Windows, предназначенное для записи экрана, создания скриншотов, захвата микрофона и системного звука, предпросмотра веб-камеры и детальной диагностики процесса записи. Текущая версия исходного кода: `2026-08-12-screenshot-toolbar-persistence-v16`.
 
-The project prioritizes recording stability, useful diagnostics and safe cleanup of background processes. Recent work extends the screenshot workflow without rewriting the validated ddagrab/NVENC/CFR recording pipeline.
+Проект ориентирован на стабильную запись, качественную диагностику проблем и безопасное завершение фоновых процессов. Последние улучшения расширяют работу со скриншотами, не затрагивая проверенный конвейер записи на базе `ddagrab / NVENC / CFR`.
 
-## Highlights
+## Основные возможности
 
-- screen capture through FFmpeg Desktop Duplication (`ddagrab`) with GDI fallback;
-- NVIDIA NVENC and CPU encoding options;
-- microphone and Windows system-audio capture;
-- CoreAudio loopback fallback when FFmpeg WASAPI is unavailable;
-- global hotkeys, including native Windows `RegisterHotKey` handling for Print Screen;
-- frozen-desktop region screenshots so menus and transient UI remain visible while selecting an area;
-- screenshot toolbar with **Region**, **Draw**, **Arrow**, **Undo** and **Clear** tools;
-- separate persistent colors and sizes for drawing and arrow tools;
-- persistent screenshot-toolbar position with automatic clamping when monitor geometry changes;
-- pause/resume and multi-segment finalization;
-- webcam preview and annotation overlay;
-- tray operation and Windows autostart support;
-- managed FFmpeg/subprocess lifecycle and shutdown cleanup;
-- structured diagnostic logs designed for root-cause analysis;
-- automated structural/regression verification in `verify_project.py`.
+- захват экрана через FFmpeg Desktop Duplication (`ddagrab`) с резервным переходом на GDI;
+- аппаратное кодирование через NVIDIA NVENC и программное кодирование на CPU;
+- запись микрофона и системного звука Windows;
+- резервный захват системного звука через CoreAudio loopback, если FFmpeg WASAPI недоступен;
+- глобальные горячие клавиши, включая нативную обработку Print Screen через Windows `RegisterHotKey`;
+- создание скриншота выделенной области по «замороженному» изображению рабочего стола, благодаря чему меню и временные элементы интерфейса не исчезают во время выделения;
+- панель инструментов скриншотов: **Область**, **Рисование**, **Стрелка**, **Отменить** и **Очистить**;
+- отдельные сохраняемые цвета и размеры для рисования и стрелок;
+- сохранение положения панели инструментов скриншотов с автоматической корректировкой при изменении конфигурации мониторов;
+- пауза и продолжение записи с последующей сборкой нескольких сегментов;
+- предпросмотр веб-камеры и слой аннотаций;
+- работа через системный трей и поддержка автозапуска Windows;
+- контролируемое управление FFmpeg и дочерними процессами с безопасной очисткой при завершении;
+- структурированные диагностические логи для поиска первопричин проблем;
+- автоматическая проверка структуры проекта и регрессий через `verify_project.py`.
 
-## Recording pipeline
+## Конвейер записи
 
-The stable GPU path is:
+Основной GPU-конвейер:
 
 ```text
 Desktop Duplication / ddagrab
-→ D3D11 frames in GPU memory
-→ wall-clock timestamps
-→ one CFR normalization step
+→ кадры D3D11 в памяти GPU
+→ временные метки по реальному времени
+→ единая нормализация CFR
 → NVIDIA NVENC
 → MP4 / MKV / AVI / MOV
 ```
 
-For the project's validated 144 Hz → 72 FPS scenario, the application polls `ddagrab` at 144 FPS and produces a 72 FPS output while preserving wall-clock timing.
+Для проверенного сценария **144 Гц → 72 FPS** приложение получает кадры через `ddagrab` с частотой 144 FPS и формирует итоговое видео 72 FPS, сохраняя корректную привязку ко времени.
 
-## Project structure
+## Структура проекта
 
 ```text
 main.py
@@ -71,68 +71,68 @@ screen_recorder/
     └── ui.py
 ```
 
-`ScreenRecorderProWin11` is assembled from mixins. The modules separate recording, audio, FFmpeg commands, lifecycle, UI, diagnostics, screenshots and finalization without changing the public launcher.
+Класс `ScreenRecorderProWin11` собирается из mixin-модулей. Такой подход разделяет логику записи, звука, FFmpeg-команд, жизненного цикла процессов, интерфейса, диагностики, скриншотов и финализации, сохраняя единый публичный запуск приложения.
 
-Detailed architecture and troubleshooting notes are available in [`Docs/README.md`](Docs/README.md).
+Подробная информация об архитектуре и устранении проблем находится в [`Docs/README.md`](Docs/README.md).
 
-## Requirements
+## Требования
 
-- Windows 10/11
-- Python
-- FFmpeg and FFprobe available through `PATH`
-- Python dependencies from `requirements.txt`
-- NVIDIA GPU is recommended for the NVENC path; CPU encoders are also exposed by the application
+- Windows 10/11;
+- Python;
+- FFmpeg и FFprobe, доступные через `PATH`;
+- Python-зависимости из `requirements.txt`;
+- для работы через NVENC рекомендуется видеокарта NVIDIA, при этом программа также поддерживает CPU-кодирование.
 
-Install Python dependencies:
+Установка зависимостей:
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-Run:
+Запуск:
 
 ```powershell
 python "Screen Recorder Pro.py"
 ```
 
-or:
+или:
 
 ```powershell
 python main.py
 ```
 
-## Verification
+## Проверка проекта
 
-The repository includes a project verifier:
+В репозитории есть встроенный инструмент проверки:
 
 ```powershell
 python verify_project.py
 python -m compileall .
 ```
 
-`verify_project.py` checks project structure, required methods, system-audio selection regressions, screenshot-region behavior and safe log-cleanup ownership rules.
+`verify_project.py` проверяет структуру проекта, наличие обязательных методов, защиту от регрессий при выборе системного звука, поведение выделения области скриншота и безопасные правила очистки логов.
 
-The v16 source package was checked before publication in a non-Windows environment: `verify_project.py` completed successfully and `compileall` found no Python syntax errors.
+Исходный пакет v16 перед публикацией проверялся в среде без Windows: `verify_project.py` завершился успешно, а `compileall` не обнаружил синтаксических ошибок Python.
 
-> Hardware-dependent behavior — real `ddagrab`, NVENC, Windows clipboard, native hotkeys and physical audio devices — still requires verification on Windows hardware.
+> Аппаратно-зависимые функции — реальная работа `ddagrab`, NVENC, буфера обмена Windows, нативных горячих клавиш и физических аудиоустройств — требуют проверки непосредственно на Windows-компьютере.
 
-## Diagnostics and reliability
+## Диагностика и надёжность
 
-The application contains dedicated diagnostics for FFmpeg commands, recording events, timing, smoothness, screenshot selection, hotkeys, errors and source-version fingerprints. Runtime logs, settings, temporary recordings and generated media are excluded from Git.
+Приложение содержит отдельную диагностику для FFmpeg-команд, событий записи, таймингов, плавности, выбора области скриншота, горячих клавиш, ошибок и версии исходного кода. Рабочие логи, настройки, временные записи и созданные медиафайлы исключены из Git.
 
-Long-running and external-process code is designed around:
+Код, связанный с длительными операциями и внешними процессами, построен с учётом:
 
-- managed child processes;
-- explicit shutdown cleanup;
-- timeouts and return-code checks;
-- bounded diagnostic files;
-- temporary-file cleanup;
-- preserving useful recording output when recovery is safe.
+- контролируемого управления дочерними процессами;
+- явной очистки ресурсов при завершении;
+- таймаутов и проверки кодов возврата;
+- ограничения размера диагностических файлов;
+- очистки временных файлов;
+- сохранения полезного результата записи, когда безопасное восстановление возможно.
 
-## AI-assisted development
+## Разработка с помощью ИИ
 
-`AGENTS.md` and the `Docs/` folder document project invariants, architecture and validation rules used during AI-assisted development with Codex/ChatGPT. AI-generated changes are treated as proposals and are validated with repository checks and manual Windows testing where hardware behavior is involved.
+`AGENTS.md` и папка `Docs/` содержат правила проекта, архитектурные ограничения и процедуры проверки, используемые при разработке с помощью Codex и ChatGPT. Изменения, созданные ИИ, рассматриваются как предложения и дополнительно проверяются встроенными тестами проекта и ручным тестированием в Windows там, где поведение зависит от оборудования.
 
-## License
+## Лицензия
 
-No open-source license is currently granted. The repository is public for portfolio and source-review purposes.
+Открытая лицензия в настоящий момент не предоставлена. Репозиторий опубликован для портфолио и ознакомления с исходным кодом.
