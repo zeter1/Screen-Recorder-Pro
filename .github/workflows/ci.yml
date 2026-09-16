@@ -3,6 +3,9 @@ name: Apply Screen Recorder Pro release
 on:
   push:
     branches: [main]
+    paths:
+      - ".release/**"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -73,10 +76,18 @@ jobs:
           for name, data in candidates:
               try:
                   with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
-                      names = archive.getnames()
-                      if not names:
+                      members = archive.getmembers()
+                      if not members:
                           raise RuntimeError('empty archive')
-                      print(f'{name}: valid tar.gz with {len(names)} entries; first={names[0]}')
+                      # Force a full read so truncated/corrupt gzip data is rejected here,
+                      # before rsync or git can touch the repository.
+                      for member in members:
+                          if member.isfile():
+                              stream = archive.extractfile(member)
+                              if stream is not None:
+                                  while stream.read(1024 * 1024):
+                                      pass
+                      print(f'{name}: valid tar.gz with {len(members)} entries; first={members[0].name}')
                   output = data
                   break
               except Exception as exc:
@@ -102,5 +113,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
+          if git diff --cached --quiet; then
+            echo "Release bundle produced no repository changes."
+            exit 0
+          fi
           git commit -m "release: update Screen Recorder Pro"
           git push origin HEAD:main
