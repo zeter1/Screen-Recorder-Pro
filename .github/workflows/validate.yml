@@ -29,6 +29,15 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
+      - name: Ensure FFmpeg is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg -y --no-progress
+          }
+          ffmpeg -version
+          ffprobe -version
+
       - name: Compile Python sources
         run: python -m compileall -q .
 
