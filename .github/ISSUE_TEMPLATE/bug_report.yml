@@ -1,0 +1,82 @@
+name: Сообщить об ошибке
+description: Сообщение о воспроизводимой проблеме Screen Recorder Pro
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо за сообщение. Чем точнее исходные данные, тем быстрее можно найти первопричину проблемы.
+        Перед публикацией логов проверьте, что в них нет личных путей, имён пользователей или другой информации, которой вы не хотите делиться публично.
+
+  - type: input
+    id: app_version
+    attributes:
+      label: Версия программы
+      description: Укажите версию/ревизию из интерфейса, README или исходного кода.
+      placeholder: "например: v16"
+    validations:
+      required: true
+
+  - type: input
+    id: windows_version
+    attributes:
+      label: Windows
+      placeholder: "например: Windows 11 24H2"
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Видеокарта и основные характеристики
+      description: Особенно важно для ddagrab/NVENC и проблем плавности.
+      placeholder: "например: NVIDIA RTX 4070, 144 Гц"
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Что произошло
+      description: Опишите фактическое поведение и момент, когда возникла проблема.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как воспроизвести
+      placeholder: |
+        1. Запустить программу
+        2. Выбрать ...
+        3. Нажать ...
+        4. Получить ошибку ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидаемое поведение
+    validations:
+      required: true
+
+  - type: textarea
+    id: capture_settings
+    attributes:
+      label: Настройки записи
+      description: FPS, монитор/область, кодек, NVENC/CPU, микрофон, системный звук и формат файла.
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Диагностика
+      description: Приложите релевантные диагностические файлы или небольшой фрагмент лога. Не публикуйте личные данные без необходимости.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Проверки
+      options:
+        - label: Я проверил, что проблема воспроизводится на текущей версии проекта.
+          required: true
+        - label: Я убрал из приложенных материалов данные, которые не хочу публиковать.
+          required: true
