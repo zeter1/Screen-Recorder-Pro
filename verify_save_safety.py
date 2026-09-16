@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import math
 import queue
+import shutil
 import struct
 import tempfile
 import unittest
@@ -14,7 +15,7 @@ from types import SimpleNamespace
 from verify_capture_recovery import harness, checked
 from screen_recorder.app import ScreenRecorderProWin11
 
-FFMPEG = Path("C:/ffmpeg/bin/ffmpeg.exe")
+FFMPEG = Path(shutil.which("ffmpeg") or "C:/ffmpeg/bin/ffmpeg.exe")
 
 class SaveSafety(unittest.TestCase):
     def setUp(self):
