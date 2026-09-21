@@ -1,12 +1,70 @@
 import atexit
+import shutil
+import subprocess
 import sys
 import tkinter as tk
+from pathlib import Path
 
 from screen_recorder.app import ScreenRecorderProWin11
-from screen_recorder.shared import SingleInstanceGuard
+from screen_recorder.shared import (
+    APP_BUILD,
+    SingleInstanceGuard,
+    resolve_ffmpeg_path,
+    resolve_ffprobe_path,
+)
+
+
+def run_packaging_smoke() -> int:
+    """Headless smoke-check used by Windows CI against the actual packaged EXE."""
+    def report(message, *, error=False):
+        stream = sys.stderr if error else sys.stdout
+        if stream is not None:
+            print(message, file=stream)
+
+    tools = [
+        ("ffmpeg", resolve_ffmpeg_path()),
+        ("ffprobe", resolve_ffprobe_path()),
+    ]
+    for name, resolved in tools:
+        if not resolved:
+            report(f"PACKAGING_SMOKE_FAIL: {name} not resolved", error=True)
+            return 20
+        candidate = Path(str(resolved))
+        executable = str(candidate) if candidate.is_file() else shutil.which(str(resolved))
+        if not executable:
+            report(f"PACKAGING_SMOKE_FAIL: {name} missing: {resolved}", error=True)
+            return 21
+        try:
+            completed = subprocess.run(
+                [executable, "-version"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                check=False,
+            )
+        except Exception as exc:
+            report(f"PACKAGING_SMOKE_FAIL: {name}: {exc!r}", error=True)
+            return 22
+        if completed.returncode != 0:
+            report(
+                f"PACKAGING_SMOKE_FAIL: {name} exit={completed.returncode}\n"
+                f"{(completed.stdout or '')[-2000:]}",
+                error=True,
+            )
+            return 23
+
+    report(f"PACKAGING_SMOKE_OK build={APP_BUILD}")
+    return 0
 
 
 def main() -> int:
+    if "--packaging-smoke" in sys.argv:
+        return run_packaging_smoke()
+
     single_instance_guard = SingleInstanceGuard()
     if not single_instance_guard.acquire():
         SingleInstanceGuard.notify_already_running()

@@ -197,8 +197,11 @@ class FileToolsMixin:
         return Path(path)
 
     def get_ffprobe_path(self):
-        """Находит ffprobe в PATH или рядом с используемым ffmpeg/EXE."""
+        """Находит bundled ffprobe, соседний с ffmpeg, либо системный ffprobe."""
         candidates = []
+        bundled_probe = resolve_ffprobe_path()
+        if bundled_probe:
+            candidates.append(Path(bundled_probe))
         try:
             ffmpeg_path = Path(str(self.ffmpeg_path))
             probe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
@@ -210,6 +213,8 @@ class FileToolsMixin:
             candidates.append(Path(probe_in_path))
         probe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
         candidates.extend([
+            BUNDLE_DIR / probe_name,
+            BUNDLE_DIR / "ffmpeg" / "bin" / probe_name,
             APP_DIR / probe_name,
             APP_DIR / "ffmpeg" / "bin" / probe_name,
         ])

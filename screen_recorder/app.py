@@ -123,7 +123,7 @@ class ScreenRecorderProWin11(
             "exists": SETTINGS_PATH.exists(),
             "settings": self.settings,
         })
-        self.ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+        self.ffmpeg_path = resolve_ffmpeg_path()
         self._encoder_support_cache = {}
         self._filter_support_cache = {}
         self._input_format_support_cache = {}
@@ -512,9 +512,11 @@ class ScreenRecorderProWin11(
         # остались сегменты — предложим собрать их в готовое видео.
         self.root.after(1500, self.recover_orphan_segments)
 
-        if shutil.which("ffmpeg") is None:
+        ffmpeg_file = Path(str(self.ffmpeg_path))
+        if not ffmpeg_file.is_file() and shutil.which(str(self.ffmpeg_path)) is None:
             messagebox.showwarning(
                 "Нужен FFmpeg",
-                "Программа работает через FFmpeg. Установи FFmpeg и добавь ffmpeg.exe в PATH.\n\n"
-                "После установки перезапусти программу."
+                "Программа не нашла встроенный FFmpeg и не нашла ffmpeg.exe в PATH.\n\n"
+                "Для portable/EXE-сборки FFmpeg должен поставляться вместе с программой. "
+                "При запуске из исходников установи FFmpeg и добавь его в PATH."
             )

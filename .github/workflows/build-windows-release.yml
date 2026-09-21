@@ -1,0 +1,126 @@
+name: Build Windows EXE
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "main.py"
+      - "Screen Recorder Pro.py"
+      - "screen_recorder/**"
+      - "requirements.txt"
+      - "scripts/build_windows_exe.ps1"
+      - ".github/workflows/build-windows-release.yml"
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+    paths:
+      - ".release-binary/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: screen-recorder-windows-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies and PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller==6.22.3"
+
+      - name: Ensure FFmpeg and FFprobe are available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue) -or -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg -y --no-progress
+          }
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Compile Python sources
+        run: python -m compileall -q .
+
+      - name: Verify project regressions
+        run: python verify_project.py
+
+      - name: Build self-contained Windows EXE
+        shell: pwsh
+        run: ./scripts/build_windows_exe.ps1
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Screen-Recorder-Pro-Windows-x64
+          path: |
+            dist/Screen-Recorder-Pro.exe
+            dist/Screen-Recorder-Pro.sha256.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download exact binary built above
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Screen-Recorder-Pro-Windows-x64
+          path: release
+
+      - name: Choose release identity
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "title=Screen Recorder Pro $GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            short_sha="${GITHUB_SHA::7}"
+            echo "tag=build-$short_sha" >> "$GITHUB_OUTPUT"
+            echo "title=Screen Recorder Pro build $short_sha" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.release_meta.outputs.title }}
+          RELEASE_PRERELEASE: ${{ steps.release_meta.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG"               release/Screen-Recorder-Pro.exe               release/Screen-Recorder-Pro.sha256.txt               --repo "$GITHUB_REPOSITORY"               --clobber
+          elif [[ "$RELEASE_PRERELEASE" == "true" ]]; then
+            gh release create "$RELEASE_TAG"               release/Screen-Recorder-Pro.exe               release/Screen-Recorder-Pro.sha256.txt               --repo "$GITHUB_REPOSITORY"               --target "$GITHUB_SHA"               --title "$RELEASE_TITLE"               --generate-notes               --prerelease
+          else
+            gh release create "$RELEASE_TAG"               release/Screen-Recorder-Pro.exe               release/Screen-Recorder-Pro.sha256.txt               --repo "$GITHUB_REPOSITORY"               --target "$GITHUB_SHA"               --title "$RELEASE_TITLE"               --generate-notes
+          fi

@@ -163,6 +163,65 @@ def get_app_folder():
 APP_DIR = get_app_folder()
 
 
+def get_bundle_folder():
+    """Каталог read-only ресурсов текущего source/PyInstaller bundle.
+
+    В PyInstaller onefile/onedir __file__ указывает внутрь bundle. Это намеренно
+    отличается от APP_DIR: APP_DIR остаётся каталогом запущенного EXE и владельцем
+    portable runtime-данных, а BUNDLE_DIR используется только для встроенных
+    ресурсов и внешних tools, добавленных в bundle.
+    """
+    try:
+        return Path(__file__).resolve().parent.parent
+    except Exception:
+        return APP_DIR
+
+
+BUNDLE_DIR = get_bundle_folder()
+
+
+def resolve_packaged_tool(tool_name):
+    """Находит bundled executable рядом с кодом/EXE, затем пробует PATH."""
+    base_name = str(tool_name or "").strip()
+    if not base_name:
+        return None
+    executable = base_name
+    if os.name == "nt" and not executable.lower().endswith(".exe"):
+        executable += ".exe"
+
+    candidates = [
+        BUNDLE_DIR / executable,
+        BUNDLE_DIR / "ffmpeg" / "bin" / executable,
+        APP_DIR / executable,
+        APP_DIR / "ffmpeg" / "bin" / executable,
+    ]
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if resolved.is_file():
+                return str(resolved)
+        except Exception:
+            continue
+
+    found = shutil.which(executable) or shutil.which(base_name)
+    return str(found) if found else None
+
+
+def resolve_ffmpeg_path():
+    return resolve_packaged_tool("ffmpeg") or ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+
+
+def resolve_ffprobe_path():
+    return resolve_packaged_tool("ffprobe")
+
 
 def get_program_entry_path():
     """Возвращает переносимую точку запуска модульной версии."""
