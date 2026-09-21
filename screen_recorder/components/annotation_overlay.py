@@ -789,7 +789,10 @@ class AnnotationOverlay:
         self.root.after(0, self.app.start_recording)
 
     def toggle_recording_pause_from_toolbar(self):
-        if not getattr(self.app, "is_recording", False) or getattr(self.app, "is_finalizing", False):
+        if (not getattr(self.app, "is_recording", False)
+                or getattr(self.app, "is_finalizing", False)
+                or getattr(self.app, "is_starting", False)
+                or getattr(self.app, "is_pause_transitioning", False)):
             return
         self.root.after(0, self._toggle_recording_pause_from_toolbar)
 
@@ -871,7 +874,7 @@ class AnnotationOverlay:
             if self.toolbar_pause_button:
                 self.toolbar_pause_button.configure(
                     text="▶ Возобновить" if paused else "⏸ Пауза",
-                    state="normal" if recording and not finalizing and not pause_transitioning else "disabled",
+                    state="normal" if recording and not starting and not finalizing and not pause_transitioning else "disabled",
                 )
             if self.toolbar_webcam_button:
                 self.toolbar_webcam_button.configure(

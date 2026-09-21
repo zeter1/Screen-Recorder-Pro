@@ -990,8 +990,8 @@ class ProcessMixin:
             # ffmpeg. Голую подстроку "recording_temp" убрали — она слишком общая.
             markers = [
                 "screenrecorderprowin11",            # -metadata encoder=... нашей записи
-                "lavfi.astats.overall.rms_level",    # наши аудио-индикаторы
-                "astats=metadata=1:reset=0.25",
+                # astats/ametadata are public FFmpeg filters, not ownership markers.
+                # Current audio meters are stopped through child_processes instead.
                 str(TEMP_RECORDINGS_DIR).lower().replace("\\", "\\\\"),
                 str(TEMP_RECORDINGS_DIR).lower(),
             ]

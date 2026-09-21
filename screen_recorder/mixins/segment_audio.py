@@ -505,9 +505,14 @@ class SegmentAudioMixin:
         prepared = []
         for segment in segments:
             wav_path = self.python_loopback_audio_segments.get(str(Path(segment)))
-            if not wav_path or not Path(wav_path).exists() or Path(wav_path).stat().st_size <= 44:
+            if not wav_path:
                 prepared.append(segment)
                 continue
+            if not Path(wav_path).is_file() or Path(wav_path).stat().st_size <= 44:
+                raise RuntimeError(
+                    f"Обязательный системный звук отсутствует или пуст: {wav_path}. "
+                    "Сохранение остановлено; исходные сегменты оставлены для восстановления."
+                )
             mixed_path = Path(segment).with_name(Path(segment).stem + "_with_system_audio" + Path(segment).suffix)
             try:
                 self.mix_python_loopback_audio_into_segment(Path(segment), Path(wav_path), mixed_path)

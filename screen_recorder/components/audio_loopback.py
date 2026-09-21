@@ -430,15 +430,27 @@ class WasapiLoopbackWaveRecorder:
                 raise RuntimeError("IAudioClient.GetMixFormat вернул пустой указатель.")
 
             fmt = ctypes.cast(p_mix_format, ctypes.POINTER(WAVEFORMATEX)).contents
-            channels = int(fmt.nChannels or 2)
+            channels = int(fmt.nChannels)
             sample_rate = int(fmt.nSamplesPerSec or 48000)
             self.output_sample_rate = sample_rate
-            bits = int(fmt.wBitsPerSample or 32)
-            block_align = int(fmt.nBlockAlign or max(1, channels * bits // 8))
+            bits = int(fmt.wBitsPerSample)
+            block_align = int(fmt.nBlockAlign)
             format_tag = int(fmt.wFormatTag)
             cb_size = int(fmt.cbSize or 0)
-            fmt_blob = ctypes.string_at(p_mix_format, ctypes.sizeof(WAVEFORMATEX) + cb_size)
-            subformat = fmt_blob[24:40] if format_tag == 0xFFFE and len(fmt_blob) >= 40 else b""
+            # WAVEFORMATEX is 18 wire bytes (ctypes may add tail padding).
+            fmt_blob = ctypes.string_at(p_mix_format, 18 + cb_size)
+            channel_mask = 0
+            valid_bits = bits
+            subformat = b""
+            if format_tag == 0xFFFE:
+                if cb_size < 22:
+                    raise ValueError("CoreAudio: неполный WAVEFORMATEXTENSIBLE.")
+                valid_bits = int.from_bytes(fmt_blob[18:20], "little")
+                channel_mask = int.from_bytes(fmt_blob[20:24], "little")
+                subformat = fmt_blob[24:40]
+            self._validate_conversion_format(channels, bits, format_tag, subformat, channel_mask, valid_bits)
+            if block_align != channels * (bits // 8):
+                raise ValueError(f"CoreAudio: неподдерживаемый размер кадра {block_align}.")
 
             initialize = ctypes.WINFUNCTYPE(
                 ctypes.c_long,
@@ -572,7 +584,10 @@ class WasapiLoopbackWaveRecorder:
                                     pcm = b"\x00" * frames * 2 * 2
                                 else:
                                     raw = ctypes.string_at(data_ptr, frames * block_align)
-                                    pcm = self._convert_to_pcm16_stereo(raw, frames, channels, bits, format_tag, subformat)
+                                    pcm = self._convert_to_pcm16_stereo(
+                                        raw, frames, channels, bits, format_tag, subformat,
+                                        channel_mask=channel_mask, valid_bits=valid_bits,
+                                    )
                                 if pcm:
                                     self._write_wav_pcm_with_limit(wav_file, pcm)
                                     frames_written += frames
@@ -615,86 +630,96 @@ class WasapiLoopbackWaveRecorder:
             if close_error is not None and not capture_exception_active:
                 raise RuntimeError(f"Не удалось корректно закрыть CoreAudio WAV: {close_error}") from close_error
 
-    def _convert_to_pcm16_stereo(self, raw, frames, channels, bits, format_tag, subformat):
-        if frames <= 0:
-            return b""
+    @classmethod
+    def _validate_conversion_format(cls, channels, bits, format_tag, subformat, channel_mask=0, valid_bits=None):
         ieee_float_guid = b"\x03\x00\x00\x00\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71"
         pcm_guid = b"\x01\x00\x00\x00\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71"
-        is_float = format_tag == 3 or subformat == ieee_float_guid
-        is_pcm = format_tag == 1 or subformat == pcm_guid
-        channels = max(1, int(channels or 2))
-
-        try:
-            if NUMPY_AVAILABLE and np is not None:
-                if is_float and bits == 32:
-                    arr = np.frombuffer(raw, dtype="<f4")
-                    arr = arr[: frames * channels].reshape((-1, channels))
-                    stereo = self._numpy_to_stereo(arr, channels)
-                    if self.volume != 1.0:
-                        stereo = stereo * self.volume
-                    stereo = np.clip(stereo, -1.0, 1.0)
-                    return (stereo * 32767.0).astype("<i2").tobytes()
-                if is_pcm and bits == 16:
-                    arr = np.frombuffer(raw, dtype="<i2")
-                    arr = arr[: frames * channels].reshape((-1, channels))
-                    stereo = self._numpy_to_stereo(arr, channels).astype(np.float32)
-                    if self.volume != 1.0:
-                        stereo = stereo * self.volume
-                    stereo = np.clip(stereo, -32768, 32767)
-                    return stereo.astype("<i2").tobytes()
-                if is_pcm and bits == 32:
-                    arr = np.frombuffer(raw, dtype="<i4")
-                    arr = arr[: frames * channels].reshape((-1, channels)).astype(np.float32) / 2147483648.0
-                    stereo = self._numpy_to_stereo(arr, channels)
-                    if self.volume != 1.0:
-                        stereo = stereo * self.volume
-                    stereo = np.clip(stereo, -1.0, 1.0)
-                    return (stereo * 32767.0).astype("<i2").tobytes()
-                if is_pcm and bits == 24:
-                    b = np.frombuffer(raw, dtype=np.uint8)
-                    usable = (len(b) // 3) * 3
-                    b = b[:usable].reshape((-1, 3))
-                    vals = (b[:, 0].astype(np.int32) | (b[:, 1].astype(np.int32) << 8) | (b[:, 2].astype(np.int32) << 16))
-                    vals = (vals ^ 0x800000) - 0x800000
-                    vals = vals[: frames * channels].reshape((-1, channels)).astype(np.float32) / 8388608.0
-                    stereo = self._numpy_to_stereo(vals, channels)
-                    if self.volume != 1.0:
-                        stereo = stereo * self.volume
-                    stereo = np.clip(stereo, -1.0, 1.0)
-                    return (stereo * 32767.0).astype("<i2").tobytes()
-        except Exception as exc:
-            self.log(f"CoreAudio conversion fallback: {exc}")
-
-        # Без numpy поддерживаем два самых частых варианта. Неизвестный формат
-        # лучше заменить тишиной, чем уронить всю запись.
-        try:
-            import struct
-            if is_float and bits == 32:
-                samples = struct.unpack("<" + "f" * (len(raw) // 4), raw)
-                out = bytearray()
-                for i in range(0, min(len(samples), frames * channels), channels):
-                    left = samples[i]
-                    right = samples[i + 1] if channels > 1 and i + 1 < len(samples) else left
-                    for value in (left, right):
-                        value = max(-1.0, min(1.0, float(value) * self.volume))
-                        out += int(value * 32767.0).to_bytes(2, "little", signed=True)
-                return bytes(out)
-            if is_pcm and bits == 16:
-                samples = memoryview(raw).cast("h")
-                out = bytearray()
-                for i in range(0, min(len(samples), frames * channels), channels):
-                    left = int(samples[i])
-                    right = int(samples[i + 1]) if channels > 1 and i + 1 < len(samples) else left
-                    for value in (left, right):
-                        value = int(max(-32768, min(32767, value * self.volume)))
-                        out += value.to_bytes(2, "little", signed=True)
-                return bytes(out)
-        except Exception:
-            pass
-        return b"\x00" * frames * 2 * 2
+        is_float = format_tag == 3 or (format_tag == 0xFFFE and subformat == ieee_float_guid)
+        is_pcm = format_tag == 1 or (format_tag == 0xFFFE and subformat == pcm_guid)
+        if not ((is_float and bits == 32) or (is_pcm and bits in (16, 24, 32))):
+            raise ValueError(f"CoreAudio: неподдерживаемый формат tag={format_tag}, bits={bits}, subtype={subformat.hex()}.")
+        if valid_bits is not None and (not 0 < valid_bits <= bits or (is_float and valid_bits != 32)):
+            raise ValueError(f"CoreAudio: недопустимое число значащих бит {valid_bits}/{bits}.")
+        return is_float, cls._stereo_weights(channels, channel_mask)
 
     @staticmethod
-    def _numpy_to_stereo(arr, channels):
-        if channels <= 1 or arr.shape[1] <= 1:
+    def _stereo_weights(channels, channel_mask):
+        # WAVEFORMATEXTENSIBLE channel order is the ascending mask bit order.
+        # Keep mono/stereo gain; downmix center/surround at -3 dB and LFE at -6 dB.
+        if channels == 1 and channel_mask in (0, 0x4):
+            return ((1.0, 1.0),)
+        if channels == 2 and channel_mask in (0, 0x3):
+            return ((1.0, 0.0), (0.0, 1.0))
+        surround = 2.0 ** -0.5
+        positions = {
+            0x1: (1.0, 0.0), 0x2: (0.0, 1.0),
+            0x4: (surround, surround), 0x8: (0.5, 0.5),
+            0x10: (surround, 0.0), 0x20: (0.0, surround),
+            0x40: (surround, 0.0), 0x80: (0.0, surround),
+            0x100: (surround, surround),
+            0x200: (surround, 0.0), 0x400: (0.0, surround),
+        }
+        weights = tuple(weight for bit, weight in positions.items() if channel_mask & bit)
+        if channels <= 0 or not channel_mask or channel_mask & ~0x7FF or len(weights) != channels:
+            raise ValueError(f"CoreAudio: неподдерживаемая маска каналов 0x{channel_mask:x} для {channels} каналов.")
+        return weights
+
+    def _convert_to_pcm16_stereo(self, raw, frames, channels, bits, format_tag, subformat,
+                                channel_mask=0, valid_bits=None):
+        import math
+        import struct
+
+        is_float, weights = self._validate_conversion_format(
+            channels, bits, format_tag, subformat, channel_mask, valid_bits,
+        )
+        sample_bytes = bits // 8
+        if frames < 0 or len(raw) != frames * channels * sample_bytes:
+            raise ValueError("CoreAudio: размер пакета не соответствует числу аудиокадров.")
+        if not math.isfinite(self.volume):
+            raise ValueError("CoreAudio: некорректная громкость.")
+        if frames == 0:
+            return b""
+        # PCM valid bits are left-aligned in their container, including 24-in-32.
+        scale = 32767.0 if is_float else 1.0 / (2 ** (bits - 16))
+        low = -32767 if is_float else -32768
+        if NUMPY_AVAILABLE and np is not None:
+            if bits == 24:
+                packed = np.frombuffer(raw, dtype=np.uint8).reshape((-1, 3)).astype(np.int32)
+                arr = packed[:, 0] | (packed[:, 1] << 8) | (packed[:, 2] << 16)
+                arr = (arr ^ 0x800000) - 0x800000
+            else:
+                arr = np.frombuffer(raw, dtype="<f4" if is_float else f"<i{sample_bytes}")
+            arr = arr.reshape((frames, channels)).astype(np.float64)
+            if not np.isfinite(arr).all():
+                raise ValueError("CoreAudio: аудиопакет содержит NaN/Infinity.")
+            stereo = self._numpy_to_stereo(arr, channels, channel_mask)
+            stereo *= self.volume * scale
+            return np.clip(stereo, low, 32767).astype("<i2").tobytes()
+
+        if is_float:
+            samples = struct.unpack(f"<{frames * channels}f", raw)
+            if not all(math.isfinite(value) for value in samples):
+                raise ValueError("CoreAudio: аудиопакет содержит NaN/Infinity.")
+        else:
+            samples = [int.from_bytes(raw[i:i + sample_bytes], "little", signed=True)
+                       for i in range(0, len(raw), sample_bytes)]
+        out = bytearray()
+        for offset in range(0, len(samples), channels):
+            for side in (0, 1):
+                value = sum(samples[offset + index] * weight[side] for index, weight in enumerate(weights))
+                value = int(max(low, min(32767, value * self.volume * scale)))
+                out += value.to_bytes(2, "little", signed=True)
+        return bytes(out)
+
+    @classmethod
+    def _numpy_to_stereo(cls, arr, channels, channel_mask=0):
+        weights = cls._stereo_weights(channels, channel_mask)
+        if channels == 1 and weights == ((1.0, 1.0),):
             return np.repeat(arr[:, :1], 2, axis=1)
-        return arr[:, :2]
+        if channels == 2 and channel_mask in (0, 0x3):
+            return arr.copy()
+        stereo = np.zeros((arr.shape[0], 2), dtype=np.float64)
+        for index, (left, right) in enumerate(weights):
+            stereo[:, 0] += arr[:, index] * left
+            stereo[:, 1] += arr[:, index] * right
+        return stereo

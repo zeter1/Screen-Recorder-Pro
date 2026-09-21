@@ -11,6 +11,9 @@ class RecordingSessionMixin:
             }, level="WARN")
             return
 
+        with self.recording_progress_lock:
+            self._active_ffmpeg_progress_token = None
+
         # Если после предыдущей записи ещё идёт тяжёлый визуальный анализ логов,
         # новая запись важнее: просим фоновый FFmpeg-анализ немедленно завершиться.
         self.cancel_post_save_diagnostics(reason="new_recording")
@@ -222,10 +225,6 @@ class RecordingSessionMixin:
                     {"recording_session_id": self.recording_session_id},
                     level="INFO",
                 )
-                try:
-                    self.root.after_idle(self.exit_app)
-                except Exception:
-                    pass
                 return
 
             self.refresh_recording_cursor_cache()
@@ -241,6 +240,9 @@ class RecordingSessionMixin:
                     pass
                 self.is_recording = False
                 self.is_finalizing = False
+                if self.cancel_start_requested:
+                    # Complete deferred exit in finally, after is_starting clears.
+                    return
                 self.set_settings_window_enabled(True)
                 self.start_audio_meters()
                 try:
@@ -278,6 +280,11 @@ class RecordingSessionMixin:
             self._stop_after_start_requested = False
             if stop_after_start and self.is_recording and not self.is_finalizing:
                 self.stop_recording()
+            if (self.cancel_start_requested and not self.is_recording
+                    and not self.is_finalizing):
+                # Every aborted-start path (including preflight/FFmpeg failure)
+                # must honor Exit, without closing from a nested startup callback.
+                self.root.after_idle(self.exit_app)
             try:
                 if self.annotation_overlay:
                     self.annotation_overlay.update_record_controls()
@@ -412,6 +419,10 @@ class RecordingSessionMixin:
             raise
 
     def launch_checked_ffmpeg_segment(self, segment_path, capture_backend):
+        failed_process = getattr(self, "_failed_start_process", None)
+        if failed_process is not None and failed_process.poll() is None:
+            raise OSError("Предыдущий FFmpeg ещё работает после ошибки запуска; новый захват заблокирован.")
+        self._failed_start_process = None
         command = self.build_ffmpeg_command(segment_path, capture_backend=capture_backend)
         try:
             click_perf = self.recording_start_requested_perf or time.perf_counter()
@@ -427,11 +438,15 @@ class RecordingSessionMixin:
             "command": self.command_to_log_text(command),
         })
 
-        self.recording_process_generation += 1
-        process_generation = self.recording_process_generation
+        with self.recording_progress_lock:
+            self._active_ffmpeg_progress_token = None
+            self.recording_process_generation += 1
+            process_generation = self.recording_process_generation
         self.current_capture_access_lost = None
         self.current_capture_access_lost_wait_logged = False
         process_launch_perf = time.perf_counter()
+        progress_reader_count = len(self.recording_progress_threads)
+        segment_count = len(self.segments)
         process = self.start_managed_process(
             command,
             stdin=subprocess.PIPE,
@@ -439,82 +454,123 @@ class RecordingSessionMixin:
             stderr=subprocess.PIPE,
             creationflags=self.recording_creation_flags(),
         )
-        self.recording_capture_backend = capture_backend
-        self.recording_ffmpeg_command = self.command_to_log_text(command)
-        self.recording_ffmpeg_args = list(command)
-        self.recording_ffmpeg_pid = getattr(process, "pid", None)
-        self.segment_capture_started_perf = None
-        self.segment_first_progress_out_time = None
-        self.current_segment_media_seconds = 0.0
-        self.current_segment_last_progress_perf = None
-        self.current_segment_last_video_frame_value = None
-        self.current_segment_last_video_frame_advance_perf = None
-        self.current_segment_last_video_frame_out_time_seconds = None
-        self.current_segment_video_stall_detected = False
-        self.start_ffmpeg_stderr_reader(
-            process,
-            log_path=self.get_current_recording_log_path(),
-            segment_path=segment_path,
-            capture_backend=capture_backend,
-            process_generation=process_generation,
-        )
-        self.start_ffmpeg_progress_reader(
-            process,
-            segment_path=segment_path,
-            capture_backend=capture_backend,
-            process_launch_perf=process_launch_perf,
-        )
-
-        # Если команда неправильная, FFmpeg падает сразу. Ждём короткое окно,
-        # но НЕ морозим GUI: качаем Tk-цикл и выходим раньше, если процесс уже
-        # упал. Кнопки на старте уже disabled, повторного клика не будет.
-        # ponytail: окно ~0.35с; если понадобится полностью неблокирующий старт —
-        # вынести start_new_segment в daemon-поток по образцу _stop_recording_worker.
-        deadline = time.perf_counter() + 0.35
-        while time.perf_counter() < deadline and process.poll() is None:
-            try:
-                self.root.update()
-            except Exception:
-                pass
-            time.sleep(0.02)
-        if process.poll() is not None:
-            code = process.returncode
-            try:
-                if process.stdin:
-                    process.stdin.close()
-            except Exception:
-                pass
-            self.wait_for_ffmpeg_stderr_reader(process, timeout=1.0)
-            self.unregister_child_process(process)
-            raise RuntimeError(f"FFmpeg сразу завершился с кодом {code}. Лог: {self.current_log_path}")
-
-        self.current_segment_engine = "ffmpeg"
-        with self.process_lock:
-            self.process = process
-
-        self.start_recording_performance_sampler()
-        self.segments.append(segment_path)
-        # Считаем только время жизни активного FFmpeg-сегмента. Раньше первый
-        # сегмент начинал таймер от клика пользователя, поэтому в длительность
-        # ошибочно попадали preflight, обратный отсчёт, открытие устройств и
-        # запуск процесса. Это создавало ложный вывод о потерянных кадрах.
-        self.segment_started_at = process_launch_perf
-        timer_start_source = "ffmpeg_process_launch"
         try:
-            self.log_handle.write(
-                f"segment_timer_start_source={timer_start_source}, "
-                f"timer_started_before_ready={time.perf_counter() - self.segment_started_at:.3f}s\n"
+            self.recording_capture_backend = capture_backend
+            self.recording_ffmpeg_command = self.command_to_log_text(command)
+            self.recording_ffmpeg_args = list(command)
+            self.recording_ffmpeg_pid = getattr(process, "pid", None)
+            self.segment_capture_started_perf = None
+            self.segment_first_progress_out_time = None
+            self.current_segment_media_seconds = 0.0
+            self.current_segment_last_progress_perf = None
+            self.current_segment_last_video_frame_value = None
+            self.current_segment_last_video_frame_advance_perf = None
+            self.current_segment_last_video_frame_out_time_seconds = None
+            self.current_segment_video_stall_detected = False
+            self.start_ffmpeg_stderr_reader(
+                process,
+                log_path=self.get_current_recording_log_path(),
+                segment_path=segment_path,
+                capture_backend=capture_backend,
+                process_generation=process_generation,
             )
-            self.log_handle.flush()
-        except Exception:
-            pass
-        self.diagnostic_log("ffmpeg_recording_segment_ready", {
-            "capture_backend": capture_backend,
-            "segment_path": segment_path,
-            "pid": getattr(process, "pid", None),
-            "timer_start_source": timer_start_source,
-            "startup_check_elapsed_sec": round(time.perf_counter() - process_launch_perf, 3),
-        })
+            self.start_ffmpeg_progress_reader(
+                process,
+                segment_path=segment_path,
+                capture_backend=capture_backend,
+                process_launch_perf=process_launch_perf,
+            )
+
+            # Если команда неправильная, FFmpeg падает сразу. Ждём короткое окно,
+            # но НЕ морозим GUI: качаем Tk-цикл и выходим раньше, если процесс уже
+            # упал. Кнопки на старте уже disabled, повторного клика не будет.
+            # ponytail: окно ~0.35с; если понадобится полностью неблокирующий старт —
+            # вынести start_new_segment в daemon-поток по образцу _stop_recording_worker.
+            deadline = time.perf_counter() + 0.35
+            while time.perf_counter() < deadline and process.poll() is None:
+                try:
+                    self.root.update()
+                except Exception:
+                    pass
+                time.sleep(0.02)
+            if process.poll() is not None:
+                code = process.returncode
+                try:
+                    if process.stdin:
+                        process.stdin.close()
+                except Exception:
+                    pass
+                self.wait_for_ffmpeg_stderr_reader(process, timeout=1.0)
+                self.unregister_child_process(process)
+                raise RuntimeError(f"FFmpeg сразу завершился с кодом {code}. Лог: {self.current_log_path}")
+
+            self.current_segment_engine = "ffmpeg"
+            with self.process_lock:
+                self.process = process
+
+            self.start_recording_performance_sampler()
+            self.segments.append(segment_path)
+            # Считаем только время жизни активного FFmpeg-сегмента. Раньше первый
+            # сегмент начинал таймер от клика пользователя, поэтому в длительность
+            # ошибочно попадали preflight, обратный отсчёт, открытие устройств и
+            # запуск процесса. Это создавало ложный вывод о потерянных кадрах.
+            self.segment_started_at = process_launch_perf
+            timer_start_source = "ffmpeg_process_launch"
+            try:
+                self.log_handle.write(
+                    f"segment_timer_start_source={timer_start_source}, "
+                    f"timer_started_before_ready={time.perf_counter() - self.segment_started_at:.3f}s\n"
+                )
+                self.log_handle.flush()
+            except Exception:
+                pass
+            self.diagnostic_log("ffmpeg_recording_segment_ready", {
+                "capture_backend": capture_backend,
+                "segment_path": segment_path,
+                "pid": getattr(process, "pid", None),
+                "timer_start_source": timer_start_source,
+                "startup_check_elapsed_sec": round(time.perf_counter() - process_launch_perf, 3),
+            })
+        except Exception as exc:
+            # A fallback must never compete with this attempt for the same file.
+            with self.recording_progress_lock:
+                if self.recording_process_generation == process_generation:
+                    self._active_ffmpeg_progress_token = None
+            try:
+                self.terminate_process_tree(process, timeout=2.0, name="failed_recording_start")
+            except Exception as cleanup_exc:
+                self.log_exception("failed_recording_start.terminate", cleanup_exc)
+            if process.poll() is None:
+                # terminate_process_tree may exhaust its bounded attempts. Keep
+                # ownership for shutdown and reject fallback/repeated launches.
+                self.register_child_process(process)
+                self._failed_start_process = process
+                with self.process_lock:
+                    self.process = process
+                raise OSError(
+                    "Не удалось остановить FFmpeg после ошибки запуска. "
+                    "Повторный захват заблокирован; закрой программу и проверь процессы."
+                ) from exc
+            self.unregister_child_process(process)
+            with self.process_lock:
+                if self.process is process:
+                    self.process = None
+            self.wait_for_ffmpeg_stderr_reader(process, timeout=1.0)
+            readers = self.recording_progress_threads[progress_reader_count:]
+            for reader in readers:
+                if reader.is_alive() and reader is not threading.current_thread():
+                    reader.join(timeout=1.0)
+            for pipe_name in ("stdin", "stdout", "stderr"):
+                pipe = getattr(process, pipe_name, None)
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError as close_exc:
+                        self.log_exception("failed_recording_start.close_pipe", close_exc)
+            if self.segments[segment_count:] == [segment_path]:
+                del self.segments[segment_count:]
+            self.segment_started_at = None
+            raise
 
     def get_recording_fps_int(self):
         try:

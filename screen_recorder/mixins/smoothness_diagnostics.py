@@ -167,6 +167,29 @@ class SmoothnessDiagnosticsMixin:
         if process is None or getattr(process, "stdout", None) is None:
             return
 
+        with self.recording_progress_lock:
+            reader_token = object()
+            self._active_ffmpeg_progress_token = reader_token
+            session_id = self.recording_session_id
+            segment_index = self.segment_index
+            progress_path = self.session_ffmpeg_progress_path
+            record_button_perf = self.recording_start_requested_perf
+            effective_fps = self.recording_effective_fps
+        events_path = (getattr(self, "session_events_path", None)
+                       if getattr(self, "_session_log_accepts_live_events", False)
+                       and self.should_write_problem_logs() else None)
+        diagnostic_started_perf = getattr(self, "diagnostic_started_perf", process_launch_perf)
+
+        def log_reader_event(event, data):
+            # Frozen destination and identity; disk I/O must not hold the state lock.
+            self._append_specialized_jsonl(events_path, {
+                "time": datetime.now().isoformat(timespec="milliseconds"),
+                "uptime_sec": round(time.perf_counter() - diagnostic_started_perf, 3),
+                "level": "INFO", "event": event,
+                "thread": threading.current_thread().name,
+                "recording_session_id": session_id, "data": data,
+            })
+
         def worker():
             current = {}
             first_sample_for_process = True
@@ -205,11 +228,11 @@ class SmoothnessDiagnosticsMixin:
                         "wall_time": datetime.now().isoformat(timespec="milliseconds"),
                         "perf_counter": round(now_perf, 6),
                         "elapsed_from_record_button_seconds": round(
-                            now_perf - float(self.recording_start_requested_perf or now_perf), 6
+                            now_perf - float(record_button_perf or now_perf), 6
                         ),
                         "elapsed_from_ffmpeg_launch_seconds": round(now_perf - process_launch_perf, 6),
-                        "recording_session_id": self.recording_session_id,
-                        "segment_index": self.segment_index,
+                        "recording_session_id": session_id,
+                        "segment_index": segment_index,
                         "segment_path": str(segment_path),
                         "capture_backend": capture_backend,
                         "ffmpeg_pid": getattr(process, "pid", None),
@@ -225,7 +248,12 @@ class SmoothnessDiagnosticsMixin:
                         "speed": self._progress_number(current.get("speed")),
                         "progress": current.get("progress"),
                     }
+                    first_frame_payload = None
                     with self.recording_progress_lock:
+                        if getattr(self, "_active_ffmpeg_progress_token", None) is not reader_token:
+                            # Keep draining the old pipe, but never credit it to a new segment.
+                            current = {}
+                            continue
                         self.recording_progress_samples.append(sample)
                         # Ограничиваем RAM, сам JSONL остаётся полным до файлового лимита.
                         if len(self.recording_progress_samples) > 30000:
@@ -251,47 +279,49 @@ class SmoothnessDiagnosticsMixin:
                                         0.0,
                                         float(out_time_seconds),
                                     )
-                    if frame is not None and frame > 0:
-                        # `-progress` приходит периодически, поэтому момент чтения
-                        # первой строки позже первого кадра. Оцениваем реальный
-                        # старт как now - уже накопленный out_time. Это устраняет
-                        # ложные ошибки 16.0 сек wall-clock против 14.7 сек файла.
-                        elapsed_video = out_time_seconds
-                        if elapsed_video is None:
+                        if frame is not None and frame > 0:
+                            # `-progress` приходит периодически, поэтому момент чтения
+                            # первой строки позже первого кадра. Оцениваем реальный
+                            # старт как now - уже накопленный out_time. Это устраняет
+                            # ложные ошибки 16.0 сек wall-clock против 14.7 сек файла.
+                            elapsed_video = out_time_seconds
+                            if elapsed_video is None:
+                                try:
+                                    elapsed_video = frame / float(effective_fps or 60)
+                                except Exception:
+                                    elapsed_video = 0.0
                             try:
-                                elapsed_video = frame / float(self.recording_effective_fps or 60)
+                                elapsed_video = max(0.0, float(elapsed_video or 0.0))
                             except Exception:
                                 elapsed_video = 0.0
-                        try:
-                            elapsed_video = max(0.0, float(elapsed_video or 0.0))
-                        except Exception:
-                            elapsed_video = 0.0
-                        estimated_capture_start_perf = max(
-                            process_launch_perf,
-                            now_perf - elapsed_video,
-                        )
-                        if self.recording_first_frame_perf is None:
-                            self.recording_first_frame_perf = estimated_capture_start_perf
-                        self.recording_last_frame_perf = now_perf
-                        if self.segment_capture_started_perf is None:
-                            self.segment_capture_started_perf = estimated_capture_start_perf
-                            self.segment_first_progress_out_time = out_time_seconds
-                            self.problem_log_event("ffmpeg_first_real_frame", {
-                                "segment_path": str(segment_path),
-                                "segment_index": self.segment_index,
-                                "ffmpeg_pid": getattr(process, "pid", None),
-                                "progress_observed_after_launch_seconds": round(now_perf - process_launch_perf, 6),
-                                "estimated_capture_start_after_launch_seconds": round(
-                                    estimated_capture_start_perf - process_launch_perf, 6
-                                ),
-                                "estimated_capture_start_after_record_button_seconds": round(
-                                    estimated_capture_start_perf - float(
-                                        self.recording_start_requested_perf or estimated_capture_start_perf
-                                    ), 6
-                                ),
-                                "frame": frame,
-                                "out_time_seconds": out_time_seconds,
-                            })
+                            estimated_capture_start_perf = max(
+                                process_launch_perf,
+                                now_perf - elapsed_video,
+                            )
+                            if self.recording_first_frame_perf is None:
+                                self.recording_first_frame_perf = estimated_capture_start_perf
+                            self.recording_last_frame_perf = now_perf
+                            if self.segment_capture_started_perf is None:
+                                self.segment_capture_started_perf = estimated_capture_start_perf
+                                self.segment_first_progress_out_time = out_time_seconds
+                                first_frame_payload = {
+                                    "segment_path": str(segment_path),
+                                    "segment_index": segment_index,
+                                    "ffmpeg_pid": getattr(process, "pid", None),
+                                    "progress_observed_after_launch_seconds": round(now_perf - process_launch_perf, 6),
+                                    "estimated_capture_start_after_launch_seconds": round(
+                                        estimated_capture_start_perf - process_launch_perf, 6
+                                    ),
+                                    "estimated_capture_start_after_record_button_seconds": round(
+                                        estimated_capture_start_perf - float(
+                                            record_button_perf or estimated_capture_start_perf
+                                        ), 6
+                                    ),
+                                    "frame": frame,
+                                    "out_time_seconds": out_time_seconds,
+                                }
+                    if first_frame_payload is not None:
+                        log_reader_event("ffmpeg_first_real_frame", first_frame_payload)
                     # В файл пишем адаптивно: старт и аномалии подробно, обычный
                     # устойчивый участок примерно раз в 2 секунды. В RAM оставляем
                     # исходные progress samples для итоговых агрегатов.
@@ -301,7 +331,7 @@ class SmoothnessDiagnosticsMixin:
                         fps_value = sample.get("fps")
                         dup_value = int(sample.get("dup_frames") or 0)
                         drop_value = int(sample.get("drop_frames") or 0)
-                        target_value = float(self.recording_effective_fps or 0.0)
+                        target_value = float(effective_fps or 0.0)
                         counter_changed = (
                             (last_written_dup is not None and dup_value != last_written_dup)
                             or (last_written_drop is not None and drop_value != last_written_drop)
@@ -326,13 +356,13 @@ class SmoothnessDiagnosticsMixin:
                         dup_value = sample.get("dup_frames")
                         drop_value = sample.get("drop_frames")
                     if should_write_file:
-                        self._append_specialized_jsonl(self.session_ffmpeg_progress_path, sample)
+                        self._append_specialized_jsonl(progress_path, sample)
                         last_file_write_perf = now_perf
                         last_written_dup = dup_value
                         last_written_drop = drop_value
                     if first_sample_for_process:
                         first_sample_for_process = False
-                        self.problem_log_event("ffmpeg_progress_started", sample)
+                        log_reader_event("ffmpeg_progress_started", sample)
                     current = {}
             except Exception as exc:
                 self.log_exception("ffmpeg_progress_reader", exc)
@@ -344,7 +374,11 @@ class SmoothnessDiagnosticsMixin:
                     "ffmpeg_pid": getattr(process, "pid", None),
                     "returncode": process.poll(),
                 }
-                self._append_specialized_jsonl(self.session_ffmpeg_progress_path, end_payload)
+                end_payload.update(recording_session_id=session_id, segment_index=segment_index)
+                try:
+                    self._append_specialized_jsonl(progress_path, end_payload)
+                finally:
+                    process.stdout.close()
 
         thread = threading.Thread(
             target=worker,

@@ -33,6 +33,24 @@ class SaveSafety(unittest.TestCase):
         checked(self.app, ["-f","lavfi","-i",src,"-c:v","libx264","-preset","ultrafast","-bf","0",str(path)])
         return path
 
+    def test_normal_merge_rejects_audio_missing_from_first_segment(self):
+        first = self.video(1, color="red")
+        second = self.video(2, color="blue")
+        self.wav(second)
+        app = self.app
+        app.python_loopback_audio_segments[str(second)] = second.with_suffix(".system_loopback.wav")
+        app.python_loopback_sync_metadata[str(second)] = {"sync_plan": app.build_python_loopback_sync_plan(100, 100)}
+        app.segments = [first, second]
+        app.output_path = self.root / "recording.mp4"
+        candidate = app.prepare_recording_output()
+        originals = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (first, second, second.with_suffix(".system_loopback.wav"))}
+        with self.assertRaisesRegex(RuntimeError, "аудиодорож"):
+            app.merge_segments()
+        self.assertFalse(candidate.exists())
+        self.assertFalse(app.output_path.exists())
+        for path, digest in originals.items():
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+
     def wav(self, source, duration=1, early=0):
         path = source.with_suffix(".system_loopback.wav")
         # Match the app-owned standard 44-byte PCM WAV, not FFmpeg's metadata chunks.

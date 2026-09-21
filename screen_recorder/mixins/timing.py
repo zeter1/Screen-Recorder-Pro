@@ -217,17 +217,17 @@ class TimingMixin:
                 timeout=20,
                 creationflags=self.creation_flags(),
             )
+            if stream_result.returncode != 0:
+                raise RuntimeError(f"FFprobe не проверил потоки: {(stream_result.stderr or '')[:2000]}")
             try:
                 parsed = json.loads(stream_result.stdout or "{}")
                 streams = parsed.get("streams") or []
                 video_streams = [item for item in streams if item.get("codec_type") == "video"]
                 audio_streams = [item for item in streams if item.get("codec_type") == "audio"]
-                stream_data = video_streams[0] if video_streams else (streams[0] if streams else {})
+                stream_data = video_streams[0]
                 format_data = parsed.get("format") or {}
-            except Exception:
-                stream_data = {"parse_error": self._safe_log_value(stream_result.stdout, max_text=2000)}
-                audio_streams = []
-                format_data = {}
+            except (ValueError, TypeError, AttributeError, IndexError) as exc:
+                raise RuntimeError("FFprobe не вернул достоверное описание видеопотока.") from exc
 
             packet_cmd = [
                 ffprobe,
@@ -253,6 +253,8 @@ class TimingMixin:
                 timeout=45,
                 creationflags=self.creation_flags(),
             )
+            if packet_result.returncode != 0:
+                raise RuntimeError(f"FFprobe не проверил пакеты: {(packet_result.stderr or '')[:2000]}")
 
             pts = []
             dts = []
@@ -276,6 +278,9 @@ class TimingMixin:
                         durations.append(float(parts[2]))
                     except Exception:
                         pass
+
+            if not pts:
+                raise RuntimeError("FFprobe не вернул временные метки видеопакетов.")
 
             intervals_ms = [
                 round((pts[index] - pts[index - 1]) * 1000.0, 3)
@@ -639,8 +644,12 @@ class TimingMixin:
     def validate_final_timing_summary(self, summary):
         """Не помечает запись успешной при сломанных FPS, PTS/DTS или звуке."""
         try:
-            if not summary:
-                return True
+            if not isinstance(summary, dict) or not isinstance(summary.get("timing_health"), dict):
+                raise RuntimeError(
+                    "Не удалось проверить тайминг итоговой записи. Файл не опубликован; "
+                    "исходные сегменты и промежуточный результат сохранены для восстановления. "
+                    "Проверь доступность ffprobe и лог ошибок."
+                )
 
             for audio_check in summary.get("audio_video_timing") or []:
                 warning = audio_check.get("warning")
@@ -739,4 +748,5 @@ class TimingMixin:
             raise
         except Exception as exc:
             self.log_exception("validate_final_timing_summary", exc)
+            raise RuntimeError("Проверка итоговой записи завершилась ошибкой; исходники сохранены.") from exc
         return True

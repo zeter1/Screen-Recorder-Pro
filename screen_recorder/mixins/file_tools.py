@@ -238,29 +238,83 @@ class FileToolsMixin:
 
     def _run_export_in_thread(self, command, out_path, busy_text, done_text):
         """Гоняет ffmpeg-экспорт в фоне, не морозя GUI; сообщает результат."""
+        if getattr(self, "_export_in_progress", False) or getattr(self, "_exiting", False):
+            return
+        self._export_in_progress = True
         self.status_var.set(busy_text)
+        results = queue.Queue(maxsize=1)
+        desired = Path(out_path)
 
         def worker():
-            ok = False
+            published = None
             err = ""
             try:
-                self.run_managed_process(
-                    command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                    encoding="utf-8", errors="ignore", timeout=1800, creationflags=self.creation_flags(),
-                )
-                ok = Path(out_path).exists() and Path(out_path).stat().st_size > 0
+                if getattr(self, "_exiting", False):
+                    raise RuntimeError("Экспорт отменён при закрытии программы.")
+                with tempfile.TemporaryDirectory(prefix=".export_", dir=desired.parent) as stage:
+                    candidate = Path(stage) / desired.name
+                    export_command = list(command)
+                    export_command[-1] = str(candidate)
+                    process = self.start_managed_process(
+                        export_command, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                        encoding="utf-8", errors="replace", creationflags=self.creation_flags(),
+                    )
+                    try:
+                        # Shutdown may have taken its child snapshot while Popen
+                        # was registering this process. Close that race locally.
+                        if getattr(self, "_exiting", False):
+                            raise RuntimeError("Экспорт отменён при закрытии программы.")
+                        _, stderr = process.communicate(timeout=1800)
+                    except BaseException:
+                        self.terminate_process_tree(process, name="export")
+                        raise
+                    finally:
+                        self.unregister_child_process(process)
+                        if getattr(process, "stderr", None) is not None:
+                            process.stderr.close()
+                    if process.returncode != 0:
+                        raise RuntimeError(f"FFmpeg завершился с ошибкой {process.returncode}: {(stderr or '')[-3000:]}")
+                    self.validate_media_file(candidate, label="результат экспорта")
+                    if getattr(self, "_exiting", False):
+                        raise RuntimeError("Экспорт отменён при закрытии программы.")
+                    target = desired
+                    counter = 2
+                    while True:
+                        try:
+                            if os.name == "nt":
+                                os.rename(candidate, target)
+                            else:
+                                os.link(candidate, target)
+                            break
+                        except FileExistsError:
+                            target = desired.with_name(f"{desired.stem} ({counter}){desired.suffix}")
+                            counter += 1
+                    published = target
             except Exception as exc:
                 err = str(exc)
-            def finish():
-                if ok:
-                    self.status_var.set(done_text)
-                    self.reveal_in_file_manager(out_path)
-                else:
-                    self.status_var.set("Не удалось выполнить экспорт.")
-                    messagebox.showerror("Ошибка экспорта", err or "FFmpeg не создал файл.")
-            self.root.after(0, finish)
+                self.log_exception("export", exc)
+            finally:
+                results.put((published, err))
+
+        def poll_result():
+            if getattr(self, "_exiting", False):
+                return
+            try:
+                published, err = results.get_nowait()
+            except queue.Empty:
+                self.root.after(100, poll_result)
+                return
+            self._export_in_progress = False
+            if published is not None:
+                self.status_var.set(done_text.replace(str(out_path), str(published)))
+                self.reveal_in_file_manager(published)
+            else:
+                self.status_var.set("Не удалось выполнить экспорт.")
+                messagebox.showerror("Ошибка экспорта", err or "FFmpeg не создал файл.")
 
         threading.Thread(target=worker, daemon=True).start()
+        self.root.after(100, poll_result)
 
     def make_gif_from_last_output(self):
         src = self._last_output_or_warn()

@@ -469,6 +469,20 @@ class FinalizeMixin:
             self.finalize_single_segment(valid_segments[0])
             return
 
+        # The concat demuxer takes stream topology from the first input. Audio
+        # appearing only in later segments can be silently discarded by FFmpeg.
+        audio_presence = []
+        for segment in valid_segments:
+            timing = self.probe_av_stream_timing(segment)
+            if not timing:
+                raise RuntimeError("Не удалось проверить аудиодорожки перед склейкой; исходники сохранены.")
+            audio_presence.append(timing.get("audio_stream_index") is not None)
+        if len(set(audio_presence)) != 1:
+            raise RuntimeError(
+                "Набор аудиодорожек сегментов различается. Склейка остановлена, "
+                "чтобы не потерять записанный звук. Исходные видео и звук сохранены для восстановления."
+            )
+
         list_path = self.temp_dir / "segments.txt"
         with open(list_path, "w", encoding="utf-8") as file:
             for segment in valid_segments:
@@ -493,7 +507,7 @@ class FinalizeMixin:
                 "-video_track_timescale", str(self.MP4_VIDEO_TRACK_TIMESCALE),
                 "-avoid_negative_ts", "make_zero",
             ]
-            if self.should_use_hevc():
+            if getattr(self, "recording_save_hevc", False):
                 command += ["-tag:v", "hvc1"]  # иначе HEVC в MP4 не играет в плеерах Windows/Apple
         else:
             command += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
@@ -520,7 +534,7 @@ class FinalizeMixin:
                 "-video_track_timescale", str(self.MP4_VIDEO_TRACK_TIMESCALE),
                 "-avoid_negative_ts", "make_zero",
             ]
-            if self.should_use_hevc():
+            if getattr(self, "recording_save_hevc", False):
                 command += ["-tag:v", "hvc1"]
         else:
             command += ["-c", "copy"]

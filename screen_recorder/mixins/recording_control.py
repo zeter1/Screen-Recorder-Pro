@@ -86,6 +86,8 @@ class RecordingControlMixin:
     def commit_current_segment_duration(self, segment_perf_end=None, reason="segment_stop"):
         """Добавляет длительность сегмента в общий таймер и пишет объяснимый лог."""
         media_seconds, wall_seconds, source = self.get_current_segment_duration_counters(segment_perf_end)
+        with self.recording_progress_lock:
+            self._active_ffmpeg_progress_token = None
         segment_key = str(self.segments[-1]) if self.segments else None
         if segment_key and getattr(self, "segment_capture_started_perf", None) is not None:
             self.recording_segment_start_perfs[segment_key] = float(self.segment_capture_started_perf)
@@ -118,7 +120,9 @@ class RecordingControlMixin:
         return payload
 
     def toggle_pause(self):
-        if not self.is_recording or self.is_finalizing or getattr(self, "is_pause_transitioning", False):
+        if (not self.is_recording or self.is_finalizing
+                or getattr(self, "is_starting", False)
+                or getattr(self, "is_pause_transitioning", False)):
             return
         if not self.is_paused:
             self.pause_recording()
@@ -126,7 +130,9 @@ class RecordingControlMixin:
             self.resume_recording()
 
     def pause_recording(self):
-        if not self.is_recording or self.is_paused or getattr(self, "is_pause_transitioning", False):
+        if (not self.is_recording or self.is_paused or self.is_finalizing
+                or getattr(self, "is_starting", False)
+                or getattr(self, "is_pause_transitioning", False)):
             return
         self.diagnostic_log("pause_recording_requested", {
             "recording_session_id": self.recording_session_id,
@@ -200,7 +206,9 @@ class RecordingControlMixin:
             pass
 
     def resume_recording(self):
-        if not self.is_recording or not self.is_paused or getattr(self, "is_pause_transitioning", False):
+        if (not self.is_recording or not self.is_paused or self.is_finalizing
+                or getattr(self, "is_starting", False)
+                or getattr(self, "is_pause_transitioning", False)):
             return
         self.diagnostic_log("resume_recording_requested", {
             "recording_session_id": self.recording_session_id,
@@ -473,6 +481,8 @@ class RecordingControlMixin:
 
         output_path = self.make_output_path_at_save_time()
         audio_bitrate = self.normalize_audio_bitrate_value(self.audio_bitrate_var.get())
+        # Read Tk variables on the main thread, before the save worker starts.
+        self.recording_save_hevc = self.should_use_hevc()
         self.cancel_auto_stop()
         self.cancel_recording_watchdog()
         self.recording_stop_requested_perf = time.perf_counter()

@@ -2,6 +2,27 @@ from ..shared import *
 
 
 class SettingsMixin:
+    def normalize_loaded_settings(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("Корень settings.json должен быть объектом JSON")
+        data = dict(data)
+        normalized_keys = []
+        for key in ("mic_volume", "system_volume"):
+            if key not in data:
+                continue
+            try:
+                value = int(data[key])
+            except (TypeError, ValueError, OverflowError):
+                value = 100
+            # Match the UI's 0..200 percent range; preserve all unrelated fields.
+            normalized = max(0, min(200, value))
+            if type(data[key]) is not int or data[key] != normalized:
+                normalized_keys.append(key)
+            data[key] = normalized
+        if normalized_keys:
+            self.diagnostic_log("settings_audio_volume_normalized", {"keys": normalized_keys}, level="WARN")
+        return data
+
     def load_settings(self):
         # Главный файл настроек хранится рядом с программой. Резервная копия
         # нужна на случай повреждения JSON после аварийного выключения Windows.
@@ -12,9 +33,7 @@ class SettingsMixin:
             try:
                 if not candidate.exists():
                     continue
-                data = json.loads(candidate.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    raise ValueError("Корень settings.json должен быть объектом JSON")
+                data = self.normalize_loaded_settings(json.loads(candidate.read_text(encoding="utf-8")))
                 if is_backup:
                     self.diagnostic_log(
                         "settings_recovered_from_backup",
@@ -44,7 +63,7 @@ class SettingsMixin:
         try:
             old_path = Path(os.getenv("APPDATA", str(Path.home()))) / APP_NAME / "settings.json"
             if old_path.exists():
-                data = json.loads(old_path.read_text(encoding="utf-8"))
+                data = self.normalize_loaded_settings(json.loads(old_path.read_text(encoding="utf-8")))
                 try:
                     SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
                     atomic_write_text(
@@ -142,8 +161,9 @@ class SettingsMixin:
                 if SETTINGS_PATH.exists():
                     previous_text = SETTINGS_PATH.read_text(encoding="utf-8")
                     previous_data = json.loads(previous_text)
-                    if isinstance(previous_data, dict):
-                        atomic_write_text(SETTINGS_BACKUP_PATH, previous_text)
+                    if self.normalize_loaded_settings(previous_data) != previous_data:
+                        raise ValueError("Предыдущие настройки требуют исправления значений; хорошая резервная копия сохранена.")
+                    atomic_write_text(SETTINGS_BACKUP_PATH, previous_text)
             except Exception as backup_exc:
                 self.diagnostic_log(
                     "settings_backup_update_skipped",
