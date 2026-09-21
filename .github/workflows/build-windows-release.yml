@@ -1,0 +1,103 @@
+name: Build Windows EXE
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "main.py"
+      - "Screen Recorder Pro.py"
+      - "screen_recorder/**"
+      - "requirements.txt"
+      - "scripts/build_windows_exe.ps1"
+      - ".github/workflows/build-windows-release.yml"
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: screen-recorder-windows-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies and PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller>=6.11,<7"
+
+      - name: Ensure FFmpeg and FFprobe are available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue) -or -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg -y --no-progress
+          }
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Compile Python sources
+        run: python -m compileall -q .
+
+      - name: Verify project regressions
+        run: python verify_project.py
+
+      - name: Build self-contained Windows EXE
+        shell: pwsh
+        run: ./scripts/build_windows_exe.ps1
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: Screen-Recorder-Pro-Windows-x64
+          path: |
+            dist/Screen-Recorder-Pro.exe
+            dist/Screen-Recorder-Pro.sha256.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download exact binary built above
+        uses: actions/download-artifact@v4
+        with:
+          name: Screen-Recorder-Pro-Windows-x64
+          path: release
+
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag"               release/Screen-Recorder-Pro.exe               release/Screen-Recorder-Pro.sha256.txt               --clobber
+          else
+            gh release create "$tag"               release/Screen-Recorder-Pro.exe               release/Screen-Recorder-Pro.sha256.txt               --title "Screen Recorder Pro $tag"               --generate-notes
+          fi
