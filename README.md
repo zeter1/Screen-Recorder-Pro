@@ -33,7 +33,19 @@
 - безопасное управление FFmpeg и очистка временных процессов;
 - структурированные диагностические логи.
 
-## Установка
+## Готовая Windows-сборка
+
+Для обычного использования **не нужно отдельно устанавливать Python, FFmpeg или Python-зависимости**.
+
+1. Откройте [GitHub Releases](https://github.com/zeter1/Screen-Recorder-Pro/releases).
+2. Скачайте `Screen-Recorder-Pro.exe` из последней Windows-сборки.
+3. Запустите EXE.
+
+GitHub Actions собирает один `Screen-Recorder-Pro.exe` через PyInstaller. Внутрь сборки включены `ffmpeg.exe` и `ffprobe.exe`, а перед публикацией CI запускает регрессионные проверки и headless smoke-test именно собранного EXE. Рядом с бинарником публикуется `Screen-Recorder-Pro.sha256.txt` для проверки целостности.
+
+> Пока EXE не подписан коммерческим code-signing сертификатом, Windows SmartScreen может показать предупреждение для нового/редко скачиваемого файла. Это отдельно от автоматической проверки сборки в CI.
+
+## Установка из исходников
 
 ### 1. Установите Python
 
@@ -56,7 +68,7 @@ cd Screen-Recorder-Pro
 python -m pip install -r requirements.txt
 ```
 
-## Запуск
+## Запуск из исходников
 
 ```powershell
 python "Screen Recorder Pro.py"

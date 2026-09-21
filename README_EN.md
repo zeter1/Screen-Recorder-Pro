@@ -33,7 +33,19 @@ The application is designed for stable long-running capture: it manages FFmpeg c
 - safe FFmpeg process management and temporary-process cleanup;
 - structured diagnostic logs.
 
-## Installation
+## Ready-to-run Windows build
+
+For normal use, you **do not need to install Python, FFmpeg, or the Python dependencies separately**.
+
+1. Open [GitHub Releases](https://github.com/zeter1/Screen-Recorder-Pro/releases).
+2. Download `Screen-Recorder-Pro.exe` from the latest Windows build.
+3. Run the EXE.
+
+GitHub Actions builds a single `Screen-Recorder-Pro.exe` with PyInstaller. The package includes `ffmpeg.exe` and `ffprobe.exe`; before publication, CI runs the regression checks and a headless smoke test against the packaged EXE itself. A `Screen-Recorder-Pro.sha256.txt` integrity file is published next to the binary.
+
+> The EXE is not currently signed with a commercial code-signing certificate, so Windows SmartScreen may warn about a new or rarely downloaded binary. That is separate from the automated CI verification.
+
+## Installation from source
 
 ### 1. Install Python
 
@@ -56,7 +68,7 @@ cd Screen-Recorder-Pro
 python -m pip install -r requirements.txt
 ```
 
-## Running
+## Running from source
 
 ```powershell
 python "Screen Recorder Pro.py"
