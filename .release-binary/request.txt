@@ -1,0 +1,5 @@
+Screen Recorder Pro Windows binary release request
+
+Purpose: build the verified one-file Windows EXE with bundled FFmpeg/FFprobe and publish it as a GitHub prerelease.
+Source baseline before this request: 212f3ccc2137c339bd7becc22e0c4806e1047e73
+Requested: 2026-09-21
