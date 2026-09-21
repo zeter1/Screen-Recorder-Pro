@@ -8,18 +8,63 @@ Set-StrictMode -Version Latest
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $projectRoot
 
-$ffmpegCommand = Get-Command ffmpeg -ErrorAction Stop
-$ffprobeCommand = Get-Command ffprobe -ErrorAction Stop
-$ffmpegPath = $ffmpegCommand.Source
-$ffprobePath = $ffprobeCommand.Source
+function Resolve-NativeFfmpegTool {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $command = Get-Command $Name -ErrorAction Stop
+    $resolved = [System.IO.Path]::GetFullPath($command.Source)
+
+    # Chocolatey exposes tiny shim executables in its global bin directory.
+    # Those shims work only while Chocolatey metadata is present and therefore
+    # must never be embedded into a portable PyInstaller EXE.
+    if ($env:ChocolateyInstall) {
+        $chocoBin = [System.IO.Path]::GetFullPath((Join-Path $env:ChocolateyInstall "bin"))
+        if ($resolved.StartsWith($chocoBin, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $libRoot = Join-Path $env:ChocolateyInstall "lib"
+            $packageRoots = @(Get-ChildItem -LiteralPath $libRoot -Directory -Filter "ffmpeg*" -ErrorAction SilentlyContinue)
+            $nativeCandidates = @(
+                foreach ($packageRoot in $packageRoots) {
+                    Get-ChildItem -LiteralPath $packageRoot.FullName -File -Filter "$Name.exe" -Recurse -ErrorAction SilentlyContinue
+                }
+            )
+            if ($nativeCandidates.Count -gt 0) {
+                # Real FFmpeg binaries are much larger than Chocolatey shims.
+                $resolved = ($nativeCandidates | Sort-Object Length -Descending | Select-Object -First 1).FullName
+            }
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw "Unable to resolve native $Name executable: $resolved"
+    }
+    return $resolved
+}
+
+function Assert-NativeToolWorks {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $output = @(& $Path -version 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Name failed before packaging with exit code $LASTEXITCODE. Path: $Path"
+    }
+    if ($output.Count -gt 0) {
+        Write-Host $output[0]
+    }
+}
+
+$ffmpegPath = Resolve-NativeFfmpegTool -Name "ffmpeg"
+$ffprobePath = Resolve-NativeFfmpegTool -Name "ffprobe"
 
 Write-Host "Source root: $projectRoot"
-Write-Host "FFmpeg: $ffmpegPath"
-Write-Host "FFprobe: $ffprobePath"
+Write-Host "Native FFmpeg: $ffmpegPath"
+Write-Host "Native FFprobe: $ffprobePath"
 python --version
 python -m PyInstaller --version
-& $ffmpegPath -version | Select-Object -First 1
-& $ffprobePath -version | Select-Object -First 1
+Assert-NativeToolWorks -Name "ffmpeg" -Path $ffmpegPath
+Assert-NativeToolWorks -Name "ffprobe" -Path $ffprobePath
 
 Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 Remove-Item -Force "$OutputName.spec" -ErrorAction SilentlyContinue
