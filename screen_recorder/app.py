@@ -125,6 +125,7 @@ class ScreenRecorderProWin11(
         })
         self.ffmpeg_path = resolve_ffmpeg_path()
         self._encoder_support_cache = {}
+        self._encoder_option_support_cache = {}
         self._filter_support_cache = {}
         self._input_format_support_cache = {}
         self._ddagrab_warm_done = False
@@ -330,7 +331,7 @@ class ScreenRecorderProWin11(
         # плавающая панель специально видна на экране и попадает в итоговое видео.
         self.annotation_toolbar_clean_frame = None
 
-        self.output_folder = tk.StringVar(value=self.settings.get("output_folder", os.getcwd()))
+        self.output_folder = tk.StringVar(value=self.settings.get("output_folder", default_recording_output_folder()))
         self.format_var = tk.StringVar(value=self.settings.get("format", "mkv"))
         self.fps_var = tk.StringVar(value=self.settings.get("fps", "60"))
         self.auto_adjust_fps_var = tk.BooleanVar(value=bool(self.settings.get("auto_adjust_fps", False)))
