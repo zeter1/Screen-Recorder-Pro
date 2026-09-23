@@ -234,6 +234,25 @@ class RecordingSessionMixin:
             except Exception as exc:
                 self.stop_cursor_highlight_overlay()
                 self.log_exception("start_recording", exc)
+                self.recording_failure_reason = str(exc)
+                try:
+                    self.write_ai_smoothness_report(
+                        outcome="recording_start_failed",
+                        error_text=str(exc),
+                    )
+                except Exception as report_exc:
+                    self.log_exception("start_recording.write_ai_smoothness_report", report_exc)
+                try:
+                    self.write_ai_problem_summary(
+                        outcome="Ошибка запуска записи",
+                        error_text=str(exc),
+                    )
+                except Exception as summary_exc:
+                    self.log_exception("start_recording.write_ai_problem_summary", summary_exc)
+                try:
+                    self.close_recording_problem_log_session(reason="start_failed")
+                except Exception:
+                    pass
                 try:
                     self.stop_recording_performance_sampler()
                 except Exception:
@@ -368,10 +387,15 @@ class RecordingSessionMixin:
                     try:
                         self.launch_checked_ffmpeg_segment(segment_path, fallback_backend)
                     except Exception as fb_exc:
-                        # Если ddagrab был выбран из кэша, но всё равно упал,
-                        # последняя безопасная попытка — gdigrab. Без повторных
-                        # ffmpeg -filters проверок в GUI-потоке.
-                        if fallback_backend != "gdigrab":
+                        # Переходим на GDI только если stderr доказывает сбой
+                        # именно Desktop Duplication. Ошибки CLI/NVENC должны
+                        # остаться исходной ошибкой, а не повторяться во второй
+                        # почти такой же FFmpeg-команде.
+                        stderr_tail = getattr(self, "current_ffmpeg_stderr_tail", "")
+                        if (
+                            fallback_backend == "ddagrab"
+                            and self.should_fallback_ddagrab_startup(stderr_tail)
+                        ):
                             self.log_exception("fallback_capture_backend", fb_exc)
                             try:
                                 if segment_path.exists():
@@ -390,8 +414,15 @@ class RecordingSessionMixin:
             try:
                 self.launch_checked_ffmpeg_segment(segment_path, capture_backend)
             except RuntimeError as exc:
-                if capture_backend == "ddagrab":
-                    self.log_handle.write(f"\n--- FALLBACK ---\nddagrab failed at start: {exc}\nTrying gdigrab...\n")
+                stderr_tail = getattr(self, "current_ffmpeg_stderr_tail", "")
+                if (
+                    capture_backend == "ddagrab"
+                    and self.should_fallback_ddagrab_startup(stderr_tail)
+                ):
+                    self.log_handle.write(
+                        f"\n--- FALLBACK ---\nddagrab initialization failed: {exc}\n"
+                        "Trying gdigrab because stderr identifies a Desktop Duplication failure.\n"
+                    )
                     self.log_handle.flush()
                     try:
                         if segment_path.exists():
@@ -400,6 +431,15 @@ class RecordingSessionMixin:
                         pass
                     self.launch_checked_ffmpeg_segment(segment_path, "gdigrab")
                 else:
+                    self.diagnostic_log(
+                        "ffmpeg_start_failure_no_capture_fallback",
+                        {
+                            "capture_backend": capture_backend,
+                            "error": str(exc),
+                            "stderr_tail": str(stderr_tail)[-2000:],
+                        },
+                        level="ERROR",
+                    )
                     raise
         except Exception:
             if python_loopback_started:
@@ -467,6 +507,7 @@ class RecordingSessionMixin:
             self.current_segment_last_video_frame_advance_perf = None
             self.current_segment_last_video_frame_out_time_seconds = None
             self.current_segment_video_stall_detected = False
+            self.current_ffmpeg_stderr_tail = ""
             self.start_ffmpeg_stderr_reader(
                 process,
                 log_path=self.get_current_recording_log_path(),
@@ -502,7 +543,20 @@ class RecordingSessionMixin:
                     pass
                 self.wait_for_ffmpeg_stderr_reader(process, timeout=1.0)
                 self.unregister_child_process(process)
-                raise RuntimeError(f"FFmpeg сразу завершился с кодом {code}. Лог: {self.current_log_path}")
+                stderr_excerpt = str(getattr(self, "current_ffmpeg_stderr_tail", "") or "").strip()
+                self.diagnostic_log(
+                    "ffmpeg_recording_segment_start_failed",
+                    {
+                        "capture_backend": capture_backend,
+                        "returncode": code,
+                        "stderr_tail": stderr_excerpt[-2000:],
+                    },
+                    level="ERROR",
+                )
+                message = f"FFmpeg сразу завершился с кодом {code}. Лог: {self.current_log_path}"
+                if stderr_excerpt:
+                    message += "\nFFmpeg stderr:\n" + stderr_excerpt[-1500:]
+                raise RuntimeError(message)
 
             self.current_segment_engine = "ffmpeg"
             with self.process_lock:
