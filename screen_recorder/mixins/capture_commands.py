@@ -311,11 +311,14 @@ class CaptureCommandsMixin:
 
         if use_nvenc:
             # Для захвата экрана важнее равномерно и быстро принимать кадры, чем
-            # держать большую очередь lookahead. Нулевой lookahead и отключённый
-            # temporal AQ уменьшают задержку/нагрузку GPU; битрейт уже имеет запас.
+            # держать большую очередь lookahead. Нулевой lookahead уменьшает
+            # задержку. AQ-параметры добавляем только если конкретная сборка
+            # FFmpeg реально показывает их в ffmpeg -h encoder=..., чтобы смена
+            # FFmpeg не ломала старт записи из-за необязательной AVOption.
+            encoder_name = "hevc_nvenc" if use_hevc else "h264_nvenc"
             cmd += [
                 "-c:v",
-                "hevc_nvenc" if use_hevc else "h264_nvenc",
+                encoder_name,
                 "-preset",
                 "fast",
                 "-rc",
@@ -328,10 +331,12 @@ class CaptureCommandsMixin:
                 bufsize2,
                 "-rc-lookahead",
                 "0",
-                "-spatial-aq",
-                "1",
-                "-temporal-aq",
-                "0",
+            ]
+            if self.ffmpeg_supports_encoder_option(encoder_name, "spatial-aq"):
+                cmd += ["-spatial-aq", "1"]
+            if self.ffmpeg_supports_encoder_option(encoder_name, "temporal-aq"):
+                cmd += ["-temporal-aq", "0"]
+            cmd += [
                 "-profile:v",
                 "main" if use_hevc else "high",
                 "-bf",
