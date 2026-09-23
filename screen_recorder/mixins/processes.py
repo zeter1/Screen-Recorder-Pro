@@ -10,6 +10,28 @@ class ProcessMixin:
         "acquirenextframe failed: 887a0026",
         "dxgi_error_access_lost",
     )
+    # Сообщения инициализации Desktop Duplication из FFmpeg ddagrab.
+    # Только эти ошибки оправдывают переключение на gdigrab. Синтаксис CLI,
+    # неизвестные encoder options и NVENC failures не должны маскироваться GDI.
+    DDAGRAB_STARTUP_FALLBACK_MARKERS = (
+        "failed querying idxgidevice",
+        "failed getting parent idxgiadapter",
+        "failed to enumerate dxgi output",
+        "failed getting output description",
+        "failed querying idxgioutput1",
+        "too many open duplication sessions",
+        "selected output not supported",
+        "invalid output duplication argument",
+        "desktop duplication access denied",
+        "failed duplicating output",
+        "only 8 bit output supported with legacy api",
+        "createvertexshader failed",
+        "createinputlayout failed",
+        "createpixelshader failed",
+        "createbuffer const buffer failed",
+        "createsamplerstate failed",
+        "createblendstate failed",
+    )
 
     @staticmethod
     def classify_recording_video_progress_health(
@@ -52,6 +74,12 @@ class ProcessMixin:
         if any(marker in normalized for marker in cls.DDAGRAB_ACCESS_LOST_MARKERS):
             return "dxgi_access_lost"
         return None
+
+    @classmethod
+    def should_fallback_ddagrab_startup(cls, text):
+        """True только для ошибок инициализации Desktop Duplication."""
+        normalized = str(text or "").lower()
+        return any(marker in normalized for marker in cls.DDAGRAB_STARTUP_FALLBACK_MARKERS)
 
     @staticmethod
     def classify_input_desktop_name(name, open_succeeded=True):
@@ -207,6 +235,10 @@ class ProcessMixin:
                         stderr_log.write(raw_bytes)
 
                         combined = scan_tail + text
+                        # Нужен для точной классификации мгновенного startup
+                        # failure: fallback захвата не должен скрывать ошибки
+                        # FFmpeg CLI/NVENC.
+                        self.current_ffmpeg_stderr_tail = combined[-4000:]
                         classification = self.classify_ffmpeg_capture_stderr(
                             combined,
                             capture_backend,

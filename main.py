@@ -9,6 +9,7 @@ from screen_recorder.app import ScreenRecorderProWin11
 from screen_recorder.shared import (
     APP_BUILD,
     SingleInstanceGuard,
+    get_source_snapshot_root,
     resolve_ffmpeg_path,
     resolve_ffprobe_path,
 )
@@ -57,7 +58,21 @@ def run_packaging_smoke() -> int:
             )
             return 23
 
-    report(f"PACKAGING_SMOKE_OK build={APP_BUILD}")
+    source_root = get_source_snapshot_root()
+    try:
+        embedded_sources = list(Path(source_root).rglob("*.py"))
+    except Exception:
+        embedded_sources = []
+    if not embedded_sources:
+        report(
+            f"PACKAGING_SMOKE_FAIL: diagnostic source snapshot is empty: {source_root}",
+            error=True,
+        )
+        return 24
+
+    report(
+        f"PACKAGING_SMOKE_OK build={APP_BUILD} embedded_sources={len(embedded_sources)}"
+    )
     return 0
 
 

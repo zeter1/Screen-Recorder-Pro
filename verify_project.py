@@ -73,6 +73,8 @@ def main() -> int:
         NO_AUDIO,
         Image,
         RECORDING_CURSOR_SIZE_PERCENT_OPTIONS,
+        default_recording_output_folder,
+        is_probably_temporary_path,
         normalize_recording_cursor_size_percent,
         normalize_screenshot_annotation_color,
         normalize_screenshot_annotation_size,
@@ -96,6 +98,8 @@ def main() -> int:
         "summarize_python_loopback_audio_sync", "classify_visual_motion_window",
         "classify_recording_video_progress_health",
         "classify_ffmpeg_capture_stderr",
+        "should_fallback_ddagrab_startup",
+        "ffmpeg_supports_encoder_option",
         "classify_input_desktop_name",
         "should_restart_after_capture_access_lost",
         "capture_signal_matches",
@@ -169,6 +173,10 @@ def main() -> int:
         return 1
     encoder_command = []
     cursor_app.should_use_hevc = lambda: False
+    cursor_app._encoder_option_support_cache = {
+        ("h264_nvenc", "spatial-aq"): True,
+        ("h264_nvenc", "temporal-aq"): True,
+    }
     cursor_app.append_encoder_options(
         encoder_command,
         72,
@@ -194,6 +202,41 @@ def main() -> int:
     ):
         print("ОШИБКА: NVENC AQ options должны использовать синтаксис FFmpeg с дефисами:", encoder_command)
         return 1
+    cursor_app._encoder_option_support_cache = {
+        ("h264_nvenc", "spatial-aq"): False,
+        ("h264_nvenc", "temporal-aq"): False,
+    }
+    no_aq_command = []
+    cursor_app.append_encoder_options(
+        no_aq_command,
+        72,
+        "16M",
+        "32M",
+        use_nvenc=True,
+        capture_backend="ddagrab",
+    )
+    if "-spatial-aq" in no_aq_command or "-temporal-aq" in no_aq_command:
+        print("ОШИБКА: неподдерживаемые NVENC AQ options попали в команду:", no_aq_command)
+        return 1
+
+    if not cursor_app.should_fallback_ddagrab_startup("Selected output not supported"):
+        print("ОШИБКА: доказанный ddagrab startup failure не разрешает GDI fallback.")
+        return 1
+    if cursor_app.should_fallback_ddagrab_startup("Unrecognized option 'spatial_aq'. Option not found"):
+        print("ОШИБКА: синтаксическая ошибка FFmpeg ошибочно разрешает GDI fallback.")
+        return 1
+    if cursor_app.should_fallback_ddagrab_startup("Error while opening encoder h264_nvenc"):
+        print("ОШИБКА: NVENC failure ошибочно разрешает GDI fallback.")
+        return 1
+
+    scoped_probe = Path(tempfile.gettempdir()) / "scoped_dir_regression_probe"
+    if not is_probably_temporary_path(scoped_probe):
+        print("ОШИБКА: scoped temp path не распознаётся как временный.")
+        return 1
+    if not str(default_recording_output_folder()).strip():
+        print("ОШИБКА: не удалось выбрать устойчивую папку записи по умолчанию.")
+        return 1
+
     cursor_app.recording_refresh_hz = 144
     if cursor_app.get_ddagrab_poll_fps(72) != 144:
         print("ОШИБКА: 144 Гц / 72 FPS больше не даёт ddagrab poll 144.")

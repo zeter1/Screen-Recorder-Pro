@@ -204,6 +204,11 @@ class InstantBufferMixin:
             return
         try:
             self.ffmpeg_supports_encoder("h264_nvenc")
+            self.ffmpeg_supports_encoder("hevc_nvenc")
+            for encoder_name in ("h264_nvenc", "hevc_nvenc"):
+                if self._encoder_support_cache.get(encoder_name):
+                    self.ffmpeg_supports_encoder_option(encoder_name, "spatial-aq")
+                    self.ffmpeg_supports_encoder_option(encoder_name, "temporal-aq")
         except Exception:
             pass
         ddagrab_ok = False
@@ -220,6 +225,10 @@ class InstantBufferMixin:
         self.diagnostic_log("preflight_worker_finish", {
             "ffmpeg_ok": self._ffmpeg_ok_cache,
             "encoder_support_cache": self._encoder_support_cache,
+            "encoder_option_support_cache": {
+                f"{encoder}:{option}": supported
+                for (encoder, option), supported in self._encoder_option_support_cache.items()
+            },
             "filter_support_cache": self._filter_support_cache,
             "input_format_support_cache": self._input_format_support_cache,
         })

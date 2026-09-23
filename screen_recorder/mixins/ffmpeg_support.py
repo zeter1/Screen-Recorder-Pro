@@ -123,6 +123,51 @@ class FfmpegSupportMixin:
         self._encoder_support_cache[key] = ok
         return ok
 
+    def ffmpeg_supports_encoder_option(self, encoder_name, option_name):
+        """Проверяет конкретную CLI-опцию энкодера через ffmpeg -h encoder=NAME.
+
+        NVENC может присутствовать в -encoders, но конкретная сборка FFmpeg
+        способна отличаться набором/именами AVOptions. Не блокируем GUI: фоновый
+        preflight заполняет кэш, а при неизвестном результате необязательная
+        опция просто не добавляется в команду записи.
+        """
+        encoder_key = str(encoder_name or "").strip().lower()
+        option_key = str(option_name or "").strip().lower().lstrip("-")
+        cache = getattr(self, "_encoder_option_support_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._encoder_option_support_cache = cache
+        key = (encoder_key, option_key)
+        if key in cache:
+            return bool(cache[key])
+        if not encoder_key or not option_key:
+            cache[key] = False
+            return False
+        if self.is_gui_thread():
+            try:
+                if self._preflight_thread is None or not self._preflight_thread.is_alive():
+                    self._preflight_thread = threading.Thread(target=self.preflight_worker, daemon=True)
+                    self._preflight_thread.start()
+            except Exception:
+                pass
+            return False
+        try:
+            result = self.run_managed_process(
+                [self.ffmpeg_path, "-hide_banner", "-h", f"encoder={encoder_key}"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=8,
+                creationflags=self.creation_flags(),
+            )
+            help_text = ((result.stdout or "") + "\n" + (result.stderr or "")).lower()
+            ok = bool(re.search(r"(?m)^\s*-" + re.escape(option_key) + r"(?=\s|$)", help_text))
+        except Exception:
+            ok = False
+        cache[key] = ok
+        return ok
+
     def ffmpeg_supports_filter(self, filter_name):
         """Проверяем фильтр FFmpeg. Для плавного захвата нужен ddagrab."""
         key = str(filter_name).lower()

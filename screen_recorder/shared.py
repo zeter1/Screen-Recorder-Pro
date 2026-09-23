@@ -84,7 +84,7 @@ except Exception:
 DXCAM_CAPTURE_ENABLED = False
 
 APP_NAME = "ScreenRecorderProWin11"
-APP_BUILD = "2026-09-23-nvenc-aq-cli-fix-v34"
+APP_BUILD = "2026-09-23-nvenc-startup-hardening-v35"
 DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v22"
 PROBLEM_LOGS_FOLDER_NAME = "Логи проблем"
 NO_AUDIO = "Не записывать"
@@ -163,6 +163,40 @@ def get_app_folder():
 APP_DIR = get_app_folder()
 
 
+def is_probably_temporary_path(path):
+    """True, если путь находится внутри системной временной папки."""
+    try:
+        Path(path).resolve().relative_to(Path(tempfile.gettempdir()).resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def default_recording_output_folder():
+    """Стабильная папка записи, даже если EXE запущен из временного каталога."""
+    candidates = []
+    if not is_probably_temporary_path(APP_DIR):
+        candidates.append(APP_DIR)
+    try:
+        candidates.append(Path.home() / "Videos")
+    except Exception:
+        pass
+    try:
+        candidates.append(Path.home())
+    except Exception:
+        pass
+    candidates.append(Path.cwd())
+
+    for folder in candidates:
+        try:
+            folder = Path(folder).expanduser()
+            folder.mkdir(parents=True, exist_ok=True)
+            return str(folder)
+        except Exception:
+            continue
+    return str(Path(tempfile.gettempdir()) / APP_NAME)
+
+
 def get_bundle_folder():
     """Каталог read-only ресурсов текущего source/PyInstaller bundle.
 
@@ -178,6 +212,18 @@ def get_bundle_folder():
 
 
 BUNDLE_DIR = get_bundle_folder()
+
+
+def get_source_snapshot_root():
+    """Корень читаемых исходников для диагностического snapshot/manifest."""
+    if getattr(sys, "frozen", False):
+        try:
+            embedded = BUNDLE_DIR / "embedded_source"
+            if embedded.is_dir():
+                return embedded
+        except Exception:
+            pass
+    return APP_DIR
 
 
 def resolve_packaged_tool(tool_name):
@@ -243,7 +289,7 @@ def get_program_entry_path():
 def write_modular_source_snapshot(target_path, max_bytes=5_000_000):
     """Сохраняет все исходники проекта в один читаемый нейросетью .py-файл."""
     target_path = Path(target_path)
-    root = APP_DIR
+    root = get_source_snapshot_root()
     chunks = [
         "# SCREEN RECORDER PRO — MODULAR SOURCE SNAPSHOT\n",
         f"# Project root: {root}\n\n",
@@ -291,7 +337,7 @@ def write_modular_source_snapshot(target_path, max_bytes=5_000_000):
 def write_modular_source_manifest(target_path):
     """Пишет компактный список исходников и SHA-256 вместо копии всего кода."""
     target_path = Path(target_path)
-    root = APP_DIR
+    root = get_source_snapshot_root()
     files = []
     for path in root.rglob("*.py"):
         try:
@@ -319,6 +365,11 @@ def write_modular_source_manifest(target_path):
         "schema": "screen_recorder_source_manifest_v1",
         "app_build": APP_BUILD,
         "project_root": str(root),
+        "source_root_kind": (
+            "embedded_packaged_source"
+            if getattr(sys, "frozen", False) and root != APP_DIR
+            else "live_project_source"
+        ),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "file_count": len(files),
         "files": files,
@@ -339,7 +390,12 @@ def get_writable_data_root():
     %LOCALAPPDATA%/ScreenRecorderProWin11. Это убирает тихие ошибки сохранения
     настроек/логов/временных файлов.
     """
-    candidates = [APP_DIR]
+    candidates = []
+    # PyInstaller/браузеры/тестовые оболочки иногда запускают EXE из
+    # %TEMP%\\scoped_dir.... Хранить там settings/logs нельзя: каталог может
+    # исчезнуть между запусками. Portable-папку сохраняем при обычном запуске.
+    if not is_probably_temporary_path(APP_DIR):
+        candidates.append(APP_DIR)
     try:
         local = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
         if local:
@@ -371,14 +427,15 @@ def get_extended_logs_root():
     создаётся отдельная папка с датой и временем записи.
     """
     candidates = []
-    try:
-        candidates.append(APP_DIR / PROBLEM_LOGS_FOLDER_NAME)
-    except Exception:
-        pass
-    try:
-        candidates.append(APP_DIR.parent / PROBLEM_LOGS_FOLDER_NAME)
-    except Exception:
-        pass
+    if not is_probably_temporary_path(APP_DIR):
+        try:
+            candidates.append(APP_DIR / PROBLEM_LOGS_FOLDER_NAME)
+        except Exception:
+            pass
+        try:
+            candidates.append(APP_DIR.parent / PROBLEM_LOGS_FOLDER_NAME)
+        except Exception:
+            pass
     try:
         candidates.append(get_writable_data_root() / PROBLEM_LOGS_FOLDER_NAME)
     except Exception:
