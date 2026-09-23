@@ -78,6 +78,9 @@ $pyInstallerArgs = @(
     "--name", $OutputName,
     "--add-binary", "$ffmpegPath;.",
     "--add-binary", "$ffprobePath;.",
+    "--add-data", "$projectRoot\screen_recorder;embedded_source\screen_recorder",
+    "--add-data", "$projectRoot\main.py;embedded_source",
+    "--add-data", "$projectRoot\Screen Recorder Pro.py;embedded_source",
     "Screen Recorder Pro.py"
 )
 
