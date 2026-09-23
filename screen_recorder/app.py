@@ -331,7 +331,21 @@ class ScreenRecorderProWin11(
         # плавающая панель специально видна на экране и попадает в итоговое видео.
         self.annotation_toolbar_clean_frame = None
 
-        self.output_folder = tk.StringVar(value=self.settings.get("output_folder", default_recording_output_folder()))
+        saved_output_folder = self.settings.get("output_folder", default_recording_output_folder())
+        try:
+            saved_output_text = str(saved_output_folder or "").strip()
+            if (
+                is_probably_temporary_path(saved_output_text)
+                and (
+                    "scoped_dir" in saved_output_text.lower()
+                    or Path(saved_output_text).resolve() == APP_DIR.resolve()
+                    or Path(saved_output_text).resolve() == Path.cwd().resolve()
+                )
+            ):
+                saved_output_folder = default_recording_output_folder()
+        except Exception:
+            pass
+        self.output_folder = tk.StringVar(value=saved_output_folder)
         self.format_var = tk.StringVar(value=self.settings.get("format", "mkv"))
         self.fps_var = tk.StringVar(value=self.settings.get("fps", "60"))
         self.auto_adjust_fps_var = tk.BooleanVar(value=bool(self.settings.get("auto_adjust_fps", False)))
