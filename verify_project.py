@@ -184,6 +184,16 @@ def main() -> int:
     ):
         print("ОШИБКА: потерян fps_mode passthrough или GPU-direct NVENC:", encoder_command)
         return 1
+    if (
+        "-spatial-aq" not in encoder_command
+        or encoder_command[encoder_command.index("-spatial-aq") + 1] != "1"
+        or "-temporal-aq" not in encoder_command
+        or encoder_command[encoder_command.index("-temporal-aq") + 1] != "0"
+        or "-spatial_aq" in encoder_command
+        or "-temporal_aq" in encoder_command
+    ):
+        print("ОШИБКА: NVENC AQ options должны использовать синтаксис FFmpeg с дефисами:", encoder_command)
+        return 1
     cursor_app.recording_refresh_hz = 144
     if cursor_app.get_ddagrab_poll_fps(72) != 144:
         print("ОШИБКА: 144 Гц / 72 FPS больше не даёт ddagrab poll 144.")
