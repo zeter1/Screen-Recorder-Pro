@@ -84,7 +84,7 @@ except Exception:
 DXCAM_CAPTURE_ENABLED = False
 
 APP_NAME = "ScreenRecorderProWin11"
-APP_BUILD = "2026-09-23-nvenc-aq-cli-fix-v34"
+APP_BUILD = "2026-09-23-nvenc-startup-hardening-v35"
 DIAGNOSTIC_SCHEMA = "screen_recorder_diagnostics_v22"
 PROBLEM_LOGS_FOLDER_NAME = "Логи проблем"
 NO_AUDIO = "Не записывать"
@@ -161,6 +161,40 @@ def get_app_folder():
 
 
 APP_DIR = get_app_folder()
+
+
+def is_probably_temporary_path(path):
+    """True, если путь находится внутри системной временной папки."""
+    try:
+        Path(path).resolve().relative_to(Path(tempfile.gettempdir()).resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def default_recording_output_folder():
+    """Стабильная папка записи, даже если EXE запущен из временного каталога."""
+    candidates = []
+    if not is_probably_temporary_path(APP_DIR):
+        candidates.append(APP_DIR)
+    try:
+        candidates.append(Path.home() / "Videos")
+    except Exception:
+        pass
+    try:
+        candidates.append(Path.home())
+    except Exception:
+        pass
+    candidates.append(Path.cwd())
+
+    for folder in candidates:
+        try:
+            folder = Path(folder).expanduser()
+            folder.mkdir(parents=True, exist_ok=True)
+            return str(folder)
+        except Exception:
+            continue
+    return str(Path(tempfile.gettempdir()) / APP_NAME)
 
 
 def get_bundle_folder():
@@ -339,7 +373,12 @@ def get_writable_data_root():
     %LOCALAPPDATA%/ScreenRecorderProWin11. Это убирает тихие ошибки сохранения
     настроек/логов/временных файлов.
     """
-    candidates = [APP_DIR]
+    candidates = []
+    # PyInstaller/браузеры/тестовые оболочки иногда запускают EXE из
+    # %TEMP%\\scoped_dir.... Хранить там settings/logs нельзя: каталог может
+    # исчезнуть между запусками. Portable-папку сохраняем при обычном запуске.
+    if not is_probably_temporary_path(APP_DIR):
+        candidates.append(APP_DIR)
     try:
         local = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
         if local:
@@ -371,14 +410,15 @@ def get_extended_logs_root():
     создаётся отдельная папка с датой и временем записи.
     """
     candidates = []
-    try:
-        candidates.append(APP_DIR / PROBLEM_LOGS_FOLDER_NAME)
-    except Exception:
-        pass
-    try:
-        candidates.append(APP_DIR.parent / PROBLEM_LOGS_FOLDER_NAME)
-    except Exception:
-        pass
+    if not is_probably_temporary_path(APP_DIR):
+        try:
+            candidates.append(APP_DIR / PROBLEM_LOGS_FOLDER_NAME)
+        except Exception:
+            pass
+        try:
+            candidates.append(APP_DIR.parent / PROBLEM_LOGS_FOLDER_NAME)
+        except Exception:
+            pass
     try:
         candidates.append(get_writable_data_root() / PROBLEM_LOGS_FOLDER_NAME)
     except Exception:
