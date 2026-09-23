@@ -1,5 +1,5 @@
 Screen Recorder Pro Windows binary release request
 
-Purpose: rebuild the verified one-file Windows EXE with bundled FFmpeg/FFprobe after fixing FFmpeg 9.0.2 NVENC AQ CLI option names (-spatial-aq / -temporal-aq).
-Source baseline before this request: 04873b2b64df8cd7db287832550fd9eebeff3173
+Purpose: build the final verified one-file Windows EXE with bundled FFmpeg/FFprobe after NVENC option probing, precise ddagrab fallback classification, persistent runtime paths, startup diagnostics, and embedded diagnostic source snapshots.
+Source baseline before this request: c8495f3da242657445938252885f747c5f5be4a0
 Requested: 2026-09-23
