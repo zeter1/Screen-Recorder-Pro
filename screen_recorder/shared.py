@@ -214,6 +214,18 @@ def get_bundle_folder():
 BUNDLE_DIR = get_bundle_folder()
 
 
+def get_source_snapshot_root():
+    """Корень читаемых исходников для диагностического snapshot/manifest."""
+    if getattr(sys, "frozen", False):
+        try:
+            embedded = BUNDLE_DIR / "embedded_source"
+            if embedded.is_dir():
+                return embedded
+        except Exception:
+            pass
+    return APP_DIR
+
+
 def resolve_packaged_tool(tool_name):
     """Находит bundled executable рядом с кодом/EXE, затем пробует PATH."""
     base_name = str(tool_name or "").strip()
@@ -277,7 +289,7 @@ def get_program_entry_path():
 def write_modular_source_snapshot(target_path, max_bytes=5_000_000):
     """Сохраняет все исходники проекта в один читаемый нейросетью .py-файл."""
     target_path = Path(target_path)
-    root = APP_DIR
+    root = get_source_snapshot_root()
     chunks = [
         "# SCREEN RECORDER PRO — MODULAR SOURCE SNAPSHOT\n",
         f"# Project root: {root}\n\n",
@@ -325,7 +337,7 @@ def write_modular_source_snapshot(target_path, max_bytes=5_000_000):
 def write_modular_source_manifest(target_path):
     """Пишет компактный список исходников и SHA-256 вместо копии всего кода."""
     target_path = Path(target_path)
-    root = APP_DIR
+    root = get_source_snapshot_root()
     files = []
     for path in root.rglob("*.py"):
         try:
@@ -353,6 +365,11 @@ def write_modular_source_manifest(target_path):
         "schema": "screen_recorder_source_manifest_v1",
         "app_build": APP_BUILD,
         "project_root": str(root),
+        "source_root_kind": (
+            "embedded_packaged_source"
+            if getattr(sys, "frozen", False) and root != APP_DIR
+            else "live_project_source"
+        ),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "file_count": len(files),
         "files": files,
