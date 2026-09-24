@@ -1,5 +1,5 @@
 Screen Recorder Pro Windows binary release request
 
-Purpose: build the final verified one-file Windows EXE with bundled FFmpeg/FFprobe after NVENC option probing, precise ddagrab fallback classification, persistent runtime paths, startup diagnostics, and embedded diagnostic source snapshots.
-Source baseline before this request: c8495f3da242657445938252885f747c5f5be4a0
-Requested: 2026-09-23
+Purpose: rebuild and republish the verified one-file Windows EXE with Russian release notes while preserving the current startup hardening, bundled FFmpeg/FFprobe, NVENC probing, ddagrab fallback classification, persistent runtime paths and startup diagnostics.
+Source baseline before this request: e01a8ce3a9d2291aab54aee18aa5351f94f797f4
+Requested: 2026-09-24
