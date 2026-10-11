@@ -6,6 +6,20 @@
 
 The application is designed for stable long-running capture: it manages FFmpeg child processes, recovers from selected failure modes, handles multiple audio sources, and preserves useful diagnostics when something goes wrong.
 
+## Download and run on Windows
+
+> Windows builds are marked **Prerelease**: they are preliminary builds for testing. A release build may differ from the current source.
+
+1. Open [GitHub Releases](https://github.com/zeter1/Screen-Recorder-Pro/releases) and expand **Assets** for the build you choose.
+2. Download and run `Screen-Recorder-Pro.exe`.
+3. Select a monitor/region, audio sources, and output folder, then start recording.
+
+Python, FFmpeg/ffprobe, and project dependencies are included. NVIDIA NVENC requires a compatible NVIDIA GPU; software CPU encoding is also available. Check a short recording with your chosen audio sources before an important session.
+
+CI runs regression checks and a headless packaged smoke test. `Screen-Recorder-Pro.sha256.txt` is published beside the EXE. Headless checks do not verify your screen/audio devices, visual smoothness, or audio synchronization.
+
+> The EXE is not commercially code-signed; Windows SmartScreen may warn about a new or rarely downloaded file.
+
 ## What this project demonstrates
 
 - a Windows screen-capture pipeline built on FFmpeg and Desktop Duplication (`ddagrab`);
@@ -32,18 +46,6 @@ The application is designed for stable long-running capture: it manages FFmpeg c
 - system tray and Windows autostart;
 - safe FFmpeg process management and temporary-process cleanup;
 - structured diagnostic logs.
-
-## Ready-to-run Windows build
-
-For normal use, you **do not need to install Python, FFmpeg, or the Python dependencies separately**.
-
-1. Open [GitHub Releases](https://github.com/zeter1/Screen-Recorder-Pro/releases).
-2. Download `Screen-Recorder-Pro.exe` from the latest Windows build.
-3. Run the EXE.
-
-GitHub Actions builds a single `Screen-Recorder-Pro.exe` with PyInstaller. The package includes `ffmpeg.exe` and `ffprobe.exe`; before publication, CI runs the regression checks and a headless smoke test against the packaged EXE itself. A `Screen-Recorder-Pro.sha256.txt` integrity file is published next to the binary.
-
-> The EXE is not currently signed with a commercial code-signing certificate, so Windows SmartScreen may warn about a new or rarely downloaded binary. That is separate from the automated CI verification.
 
 ## Installation from source
 
