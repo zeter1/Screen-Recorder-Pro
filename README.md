@@ -186,7 +186,7 @@ GitHub Actions выполняет эти проверки на Windows runner и
 
 Открытая лицензия в настоящий момент не предоставлена. Репозиторий опубликован для портфолио и ознакомления с исходным кодом.
 
-## Контакты для связи с разработчиком
+## Контакты для связи:
 
 - [zeter11@gmail.com](mailto:zeter11@gmail.com)
 - [https://t.me/zeter1](https://t.me/zeter1)
@@ -198,4 +198,5 @@ GitHub Actions выполняет эти проверки на Windows runner и
 - [https://x.com/zeter1](https://x.com/zeter1)
 - [https://www.threads.com/@zeter1992](https://www.threads.com/@zeter1992)
 - [https://ok.ru/zeter1](https://ok.ru/zeter1)
-- [https://t.me/zeterchat](https://t.me/zeterchat) — Telegram-группа: обо мне, проекты и чат
+- [https://t.me/zeterchat](https://t.me/zeterchat) - Telegram-группа для общения
+- [https://dkoles.com/](https://dkoles.com/) - сайт.
